@@ -59,7 +59,7 @@ class MotorSafetyTest {
         policy.record(false, false, MountStatus.ONLINE)
         val result = policy.record(false, false, MountStatus.ONLINE)
         assertTrue(result.quiet); assertEquals(MountStatus.OFFLINE, result.status)
-        val intent = motor.invalidateForDisconnect(); motor.resetAppliedIfCurrent(intent.generation)
+        val intent = motor.beginHeartbeatInhibit("HEARTBEAT_FAILURE"); motor.markAppliedUnknownIfCurrent(intent.generation)
         assertTrue(fake.packets.isEmpty())
         assertTrue(policy.record(false, false, MountStatus.OFFLINE).quiet)
     }

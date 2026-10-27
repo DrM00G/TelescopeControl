@@ -58,7 +58,10 @@ class MandatoryMotorScenariosTest {
         motor.updateDesiredState(stop, stop, "dec stop")
         release.complete(Unit)
         yield()
-        assertEquals(emptyList<List<Byte>>(), fake.packets)
+        assertEquals(listOf(
+            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
+            fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0)
+        ), fake.packets)
         assertEquals(stop, motor.currentIntent.dec)
         motor.stopWorker()
     }
@@ -81,6 +84,7 @@ class MandatoryMotorScenariosTest {
         release.complete(Unit)
         yield()
         assertEquals(listOf(
+            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
             fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 4),
             fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0),
             fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0),
@@ -107,7 +111,7 @@ class MandatoryMotorScenariosTest {
         release.complete(Unit)
         assertEquals(StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED, emergency.await())
         yield()
-        assertEquals(stops() + listOf(variablePacket(SlewAxis.RA, 60.0)), fake.packets)
+        assertEquals(listOf(fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0)) + stops() + listOf(variablePacket(SlewAxis.RA, 60.0)), fake.packets)
         assertEquals(newer, motor.currentIntent)
         motor.stopWorker()
     }
@@ -141,7 +145,10 @@ class MandatoryMotorScenariosTest {
         motor.updateDesiredState(stop, stop, "zero")
         release.complete(Unit)
         yield()
-        assertEquals(emptyList<List<Byte>>(), fake.packets)
+        assertEquals(listOf(
+            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
+            fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0)
+        ), fake.packets)
         assertEquals(stop, motor.currentIntent.ra)
         motor.stopWorker()
     }
@@ -175,11 +182,11 @@ class MandatoryMotorScenariosTest {
         motor.stopIfCurrent(stopIntent, 250)
         val second = policy.record(false, false, first.status)
         assertTrue(second.quiet); assertFalse(second.ready); assertEquals(MountStatus.OFFLINE, second.status)
-        val invalidated = motor.invalidateForDisconnect()
-        motor.resetAppliedIfCurrent(invalidated.generation)
+        val invalidated = motor.beginHeartbeatInhibit("HEARTBEAT_FAILURE")
+        motor.markAppliedUnknownIfCurrent(invalidated.generation)
         assertTrue(invalidated.generation > stopIntent.generation)
         assertEquals(stop, invalidated.ra); assertEquals(stop, invalidated.dec)
-        assertEquals(listOf(variablePacket(SlewAxis.DEC, 420.0)) + stops(), fake.packets)
+        assertEquals(listOf(fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0), variablePacket(SlewAxis.DEC, 420.0)) + stops(), fake.packets)
         motor.stopWorker()
     }
 }

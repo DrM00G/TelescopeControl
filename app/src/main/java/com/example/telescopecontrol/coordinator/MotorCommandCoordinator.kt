@@ -39,8 +39,23 @@ class MotorCommandCoordinator(
     private val generationLock = Any()
     private class StaleMovementException : IOException("Movement generation superseded")
 
-    private var currentAppliedRaState: DesiredAxisState = DesiredAxisState.Stop
-    private var currentAppliedDecState: DesiredAxisState = DesiredAxisState.Stop
+    // Null means the physical outcome is unknown, not that a stop was applied.
+    private var currentAppliedRaState: DesiredAxisState? = null
+    private var currentAppliedDecState: DesiredAxisState? = null
+    private var recoveryInhibit = false
+
+    suspend fun appliedStates(): Pair<DesiredAxisState?, DesiredAxisState?> = movementMutex.withLock {
+        currentAppliedRaState to currentAppliedDecState
+    }
+
+    fun beginHeartbeatInhibit(reason: String): MotorIntent = synchronized(generationLock) {
+        recoveryInhibit = true
+        _motorIntent.updateAndGet { current ->
+            MotorIntent(current.generation + 1, DesiredAxisState.Stop, DesiredAxisState.Stop, reason)
+        }
+    }
+
+    fun endHeartbeatInhibit() = synchronized(generationLock) { recoveryInhibit = false }
 
     private val stateChannel = Channel<MotorIntent>(Channel.CONFLATED)
     private var workerJob: Job? = null
@@ -75,6 +90,7 @@ class MotorCommandCoordinator(
         reason: String
     ): MotorIntent {
         val newIntent = synchronized(generationLock) {
+            if (recoveryInhibit) return@synchronized _motorIntent.get()
             val next = _motorIntent.updateAndGet { current ->
                 MotorIntent(current.generation + 1, raState, decState, reason)
             }
@@ -90,7 +106,7 @@ class MotorCommandCoordinator(
      */
     suspend fun resetStatesQuietly(): MotorIntent {
         val resetIntent = invalidateForDisconnect()
-        resetAppliedIfCurrent(resetIntent.generation)
+        markAppliedUnknownIfCurrent(resetIntent.generation)
         return resetIntent
     }
 
@@ -100,10 +116,14 @@ class MotorCommandCoordinator(
         }
     }
 
-    suspend fun resetAppliedIfCurrent(generation: Long) = movementMutex.withLock {
+    /** Only for the quiet cleanup following a confirmed physical USB detach. */
+    suspend fun resetAppliedIfCurrent(generation: Long) = markAppliedUnknownIfCurrent(generation)
+
+    /** Forget untrustworthy acknowledgements without sending a motor command. */
+    suspend fun markAppliedUnknownIfCurrent(generation: Long) = movementMutex.withLock {
         if (_motorIntent.get().generation == generation) {
-            currentAppliedRaState = DesiredAxisState.Stop
-            currentAppliedDecState = DesiredAxisState.Stop
+            currentAppliedRaState = null
+            currentAppliedDecState = null
         }
     }
 
@@ -147,6 +167,8 @@ class MotorCommandCoordinator(
         return withContext(NonCancellable) { movementMutex.withLock {
             if (onlyIfCurrent && _motorIntent.get().generation != stopIntent.generation) return@withLock StopDiagnosticStatus.STOP_REQUESTED
             if (!usbConnection.isConnected()) {
+                currentAppliedRaState = null
+                currentAppliedDecState = null
                 val warning = "SAFETY WARNING: STOP unavailable — USB connection lost; physical motor state unknown"
                 logger(warning, true)
                 onErrorWarning(warning)
@@ -154,6 +176,9 @@ class MotorCommandCoordinator(
             }
 
             var stopFailed = false
+            // A partial or missing acknowledgement leaves both physical axes uncertain.
+            currentAppliedRaState = null
+            currentAppliedDecState = null
 
             // 1. RA POS rate 0
             val raPosBytes = NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.POSITIVE, 0)
@@ -291,7 +316,7 @@ class MotorCommandCoordinator(
 
     private suspend fun applySingleAxisState(
         axis: SlewAxis,
-        prevApplied: DesiredAxisState,
+        prevApplied: DesiredAxisState?,
         newTarget: DesiredAxisState,
         generation: Long,
         reason: String

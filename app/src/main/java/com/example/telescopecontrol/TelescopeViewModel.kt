@@ -8,7 +8,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.telescopecontrol.coordinator.MotorCommandCoordinator
-import com.example.telescopecontrol.coordinator.HeartbeatPolicy
+import com.example.telescopecontrol.coordinator.HeartbeatRecovery
 import com.example.telescopecontrol.model.AlignmentTrust
 import com.example.telescopecontrol.model.DesiredAxisState
 import com.example.telescopecontrol.model.EquatorialCoordinates
@@ -131,7 +131,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     )
 
     private val travelEnvelope = MountTravelEnvelope()
-    private val heartbeatPolicy = HeartbeatPolicy()
+    private val heartbeatRecovery = HeartbeatRecovery(motorCoordinator)
 
     // Outlives viewModelScope so lifecycle shutdown can finish before closing the port.
     private val safetyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -289,10 +289,11 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     handControllerStatus = HandControllerStatus.CONNECTED,
                     status = "CONNECTED (${driver.javaClass.simpleName})",
                     detectedDriver = driver.javaClass.name,
+                    trackingMode = TrackingMode.UNKNOWN,
                     error = null
                 )
             }
-            heartbeatPolicy.reset()
+            heartbeatRecovery.reset()
             initializeMountAndStartLoops()
         } catch (e: IOException) {
             log("Exception opening port: ${e.message}", isError = true)
@@ -330,6 +331,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 connected = false,
                 handControllerStatus = HandControllerStatus.DISCONNECTED,
                 mountStatus = MountStatus.OFFLINE,
+                trackingMode = TrackingMode.UNKNOWN,
                 status = "USB DISCONNECTED — Device Removed",
                 isSlewing = false,
                 activeSlewAxis = null,
@@ -495,17 +497,39 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         val decOk = decVersionStr != null
 
         val previousState = _uiState.value
-        val result = heartbeatPolicy.record(raOk, decOk, previousState.mountStatus)
-        val newMountStatus = result.status
-        val stopIntent = if (result.stop) {
+        val outcome = heartbeatRecovery.record(raOk, decOk, previousState.mountStatus, onFailure = {
             controlEpoch++
             raOverride = null
             decOverride = null
-            motorCoordinator.invalidateForStop("HEARTBEAT_FAILURE")
-        } else if (result.quiet) {
-            controlEpoch++
-            motorCoordinator.invalidateForDisconnect()
-        } else null
+            _uiState.update { state -> state.copy(isAvxReady = false, consecutiveHeartbeats = 0,
+                desiredRa = DesiredAxisState.Stop, desiredDec = DesiredAxisState.Stop,
+                manualTrackEnabled = false, backgroundRaArcsecPerSec = 0.0, backgroundDecArcsecPerSec = 0.0,
+                trackingMode = TrackingMode.UNKNOWN,
+                stopDiagnosticStatus = StopDiagnosticStatus.STOP_REQUESTED) }
+        }, verifyStationary = { generation ->
+            val verificationEpoch = controlEpoch
+            try {
+                // Query after the STOP ACK; a cached OFF from before communication loss is not evidence.
+                val mode = NexStarProtocol.parseTrackingMode(
+                    usbConnection.transactSafe(NexStarProtocol.GET_TRACKING_MODE, timeoutMs = 1000)
+                )
+                if (verificationEpoch != controlEpoch || shuttingDown || !usbConnection.isConnected() ||
+                    motorCoordinator.currentIntent.generation != generation) {
+                    null
+                } else {
+                    _uiState.update { it.copy(trackingMode = mode) }
+                    if (mode == TrackingMode.OFF) verifyFreshStop(generation, verificationEpoch) else null
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _uiState.update { it.copy(trackingMode = TrackingMode.UNKNOWN) }
+                null
+            }
+        })
+        if (shuttingDown || !usbConnection.isConnected()) return
+        val result = outcome.heartbeat
+        val newMountStatus = result.status
+        val stopIntent = if (!raOk || !decOk) motorCoordinator.currentIntent else null
         val prevMountStatus = previousState.mountStatus
         if (prevMountStatus == MountStatus.ONLINE && newMountStatus == MountStatus.OFFLINE) {
             log("AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING", isError = true)
@@ -563,18 +587,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 commandedDecArcsecPerSec = if (stopIntent != null) 0.0 else state.commandedDecArcsecPerSec,
                 highSpeedBackgroundWarning = if (stopIntent != null) false else state.highSpeedBackgroundWarning,
                 motorGeneration = stopIntent?.generation ?: state.motorGeneration,
-                stopDiagnosticStatus = if (result.stop) StopDiagnosticStatus.STOP_REQUESTED else state.stopDiagnosticStatus
+                stopDiagnosticStatus = outcome.stopStatus ?: if (result.quiet) StopDiagnosticStatus.STOP_REQUESTED else state.stopDiagnosticStatus
             )
-        }
-        if (stopIntent != null) {
-            if (result.stop) {
-                val status = motorCoordinator.stopIfCurrent(stopIntent, timeoutMs = 250)
-                if (motorCoordinator.currentIntent.generation == stopIntent.generation && !shuttingDown) {
-                    _uiState.update { it.copy(stopDiagnosticStatus = status) }
-                }
-            } else {
-                motorCoordinator.resetAppliedIfCurrent(stopIntent.generation)
-            }
         }
     }
 
@@ -1166,6 +1180,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     connected = false,
                     handControllerStatus = HandControllerStatus.DISCONNECTED,
                     mountStatus = MountStatus.UNKNOWN,
+                    trackingMode = TrackingMode.UNKNOWN,
                     status = "DISCONNECTED",
                     error = null,
                     isSlewing = false,

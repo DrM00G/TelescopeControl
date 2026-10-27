@@ -238,7 +238,7 @@ object NexStarProtocol {
      * Parses the response for Get Tracking Mode command ('t').
      */
     fun parseTrackingMode(response: ByteArray): TrackingMode {
-        if (response.isEmpty()) return TrackingMode.UNKNOWN
+        if (response.size != 2 || response[1] != '#'.code.toByte()) return TrackingMode.UNKNOWN
         val modeVal = response[0].toInt() and 0xFF
         return TrackingMode.fromProtocolValue(modeVal)
     }

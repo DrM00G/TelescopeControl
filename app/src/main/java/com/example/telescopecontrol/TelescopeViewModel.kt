@@ -9,6 +9,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.telescopecontrol.coordinator.MotorCommandCoordinator
 import com.example.telescopecontrol.coordinator.HeartbeatRecovery
+import com.example.telescopecontrol.diagnostics.EngineeringSessionLogger
 import com.example.telescopecontrol.model.AlignmentTrust
 import com.example.telescopecontrol.model.DesiredAxisState
 import com.example.telescopecontrol.model.EquatorialCoordinates
@@ -38,6 +39,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -95,6 +97,9 @@ data class TelescopeUiState(
     // v0.3 / v0.3.2 fields
     val isAvxReady: Boolean = false,
     val consecutiveHeartbeats: Int = 0,
+    val lastHeartbeatWallMillis: Long? = null,
+    val lastHeartbeatElapsedMillis: Long? = null,
+    val engineeringLogError: String? = null,
     val manualTrackEnabled: Boolean = false,
     val backgroundRaArcsecPerSec: Double = 0.0,
     val backgroundDecArcsecPerSec: Double = 0.0,
@@ -120,6 +125,14 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val _uiState = MutableStateFlow(TelescopeUiState())
     val uiState: StateFlow<TelescopeUiState> = _uiState.asStateFlow()
+    private val engineeringLogger = EngineeringSessionLogger(
+        directory = File(context.filesDir, "engineering_logs"),
+        elapsedMillis = SystemClock::elapsedRealtime,
+        onError = { message ->
+            Log.e(TAG, message)
+            _uiState.update { it.copy(engineeringLogError = message) }
+        }
+    )
 
     val motorCoordinator = MotorCommandCoordinator(
         usbConnection = usbConnection,
@@ -127,7 +140,13 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         onErrorWarning = { warn ->
             _uiState.update { it.copy(alignmentWarning = warn) }
         },
-        onMovementFailure = { safetyScope.launch { stopAll() } }
+        onMovementFailure = { safetyScope.launch { stopAll() } },
+        onIntentPublished = { intent ->
+            engineeringLogger.record("INTENT", intent.generation, "reason=${intent.reason} ra=${intent.ra} dec=${intent.dec}")
+        },
+        onDiscarded = { generation, current, reason ->
+            engineeringLogger.record("DISCARD", generation, "current=$current reason=$reason")
+        }
     )
 
     private val travelEnvelope = MountTravelEnvelope()
@@ -167,10 +186,16 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(isUsbHostSupported = hasHostFeature) }
         log("USB Host support: $hasHostFeature")
         scanDevices()
+        usbConnection.generationProvider = { motorCoordinator.currentIntent.generation }
+        usbConnection.wireLogger = { direction, generation, bytes, detail ->
+            val message = "bytes=${bytes.toHexString()}${detail?.let { " detail=$it" } ?: ""}"
+            engineeringLogger.record("WIRE_$direction", generation, message)
+        }
         motorCoordinator.start(viewModelScope)
     }
 
     private fun log(message: String, isError: Boolean = false) {
+        engineeringLogger.record(if (isError) "ERROR" else "STATUS", motorCoordinator.currentIntent.generation, message)
         if (isError) {
             Log.e(TAG, message)
         } else {
@@ -282,7 +307,12 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         log("Opening port for device ${driver.device.deviceName}...")
         try {
             usbConnection.open(driver)
+            engineeringLogger.startSession("device=${driver.device.deviceName} vid=${driver.device.vendorId} pid=${driver.device.productId}", motorCoordinator.currentIntent.generation)
             log("Port opened successfully.")
+            lastRaPosInt = null
+            lastDecPosInt = null
+            lastRaTimeMs = 0L
+            lastDecTimeMs = 0L
             _uiState.update {
                 it.copy(
                     connected = true,
@@ -290,6 +320,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     status = "CONNECTED (${driver.javaClass.simpleName})",
                     detectedDriver = driver.javaClass.name,
                     trackingMode = TrackingMode.UNKNOWN,
+                    lastHeartbeatWallMillis = null,
+                    lastHeartbeatElapsedMillis = null,
                     error = null
                 )
             }
@@ -321,6 +353,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         safetyJob = safetyScope.launch {
             previousSafetyJob?.join()
             motorCoordinator.closeConnection()
+            engineeringLogger.endSession(resetIntent.generation, "USB detached")
             motorCoordinator.resetAppliedIfCurrent(resetIntent.generation)
             if (!cleared && controlEpoch == detachEpoch) shuttingDown = false
         }
@@ -332,6 +365,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 handControllerStatus = HandControllerStatus.DISCONNECTED,
                 mountStatus = MountStatus.OFFLINE,
                 trackingMode = TrackingMode.UNKNOWN,
+                lastHeartbeatWallMillis = null,
+                lastHeartbeatElapsedMillis = null,
                 status = "USB DISCONNECTED — Device Removed",
                 isSlewing = false,
                 activeSlewAxis = null,
@@ -497,12 +532,29 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         val decOk = decVersionStr != null
 
         val previousState = _uiState.value
-        val outcome = heartbeatRecovery.record(raOk, decOk, previousState.mountStatus, onFailure = {
+        // Record receipt before recovery STOP/verification can delay completion.
+        if (raOk && decOk) {
+            val wall = System.currentTimeMillis()
+            val elapsed = SystemClock.elapsedRealtime()
+            _uiState.update { it.copy(lastHeartbeatWallMillis = wall, lastHeartbeatElapsedMillis = elapsed) }
+        }
+        engineeringLogger.record("HEARTBEAT", motorCoordinator.currentIntent.generation,
+            "ra=$raOk dec=$decOk previous=${previousState.mountStatus}")
+        val outcome = heartbeatRecovery.record(raOk, decOk, previousState.mountStatus, onFailure = { failure ->
             controlEpoch++
             raOverride = null
             decOverride = null
-            _uiState.update { state -> state.copy(isAvxReady = false, consecutiveHeartbeats = 0,
+            engineeringLogger.record("HEARTBEAT", motorCoordinator.currentIntent.generation,
+                "status=${failure.status} ready=false stop=pending")
+            _uiState.update { state -> state.copy(mountStatus = failure.status,
+                raMcVersion = raVersionStr ?: "NO RESPONSE", decMcVersion = decVersionStr ?: "NO RESPONSE",
+                alignmentWarning = if (failure.quiet) "AVX OFFLINE — MOTOR CONTROLLERS NOT RESPONDING" else "AVX COMMUNICATION INTERRUPTED — STOPPING MOTORS",
+                isAvxReady = false, consecutiveHeartbeats = 0,
                 desiredRa = DesiredAxisState.Stop, desiredDec = DesiredAxisState.Stop,
+                isSlewing = false, activeSlewAxis = null, activeSlewDirection = null,
+                activeRaDirection = null, activeDecDirection = null,
+                commandedRaArcsecPerSec = 0.0, commandedDecArcsecPerSec = 0.0,
+                highSpeedBackgroundWarning = false, motorGeneration = motorCoordinator.currentIntent.generation,
                 manualTrackEnabled = false, backgroundRaArcsecPerSec = 0.0, backgroundDecArcsecPerSec = 0.0,
                 trackingMode = TrackingMode.UNKNOWN,
                 stopDiagnosticStatus = StopDiagnosticStatus.STOP_REQUESTED) }
@@ -528,13 +580,15 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         })
         if (shuttingDown || !usbConnection.isConnected()) return
         val result = outcome.heartbeat
+        engineeringLogger.record("HEARTBEAT", motorCoordinator.currentIntent.generation,
+            "status=${result.status} ready=${result.ready} successes=${result.successes} stop=${outcome.stopStatus} recoveryPending=${heartbeatRecovery.needsStopOnRecovery}")
         val newMountStatus = result.status
         val stopIntent = if (!raOk || !decOk) motorCoordinator.currentIntent else null
         val prevMountStatus = previousState.mountStatus
-        if (prevMountStatus == MountStatus.ONLINE && newMountStatus == MountStatus.OFFLINE) {
-            log("AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING", isError = true)
+        if (prevMountStatus != MountStatus.OFFLINE && newMountStatus == MountStatus.OFFLINE) {
+            log("MOTOR CONTROLLERS NOT RESPONDING", isError = true)
         } else if (prevMountStatus == MountStatus.OFFLINE && newMountStatus == MountStatus.ONLINE) {
-            log("AVX POWER RESTORED")
+            log("MOTOR CONTROLLER COMMUNICATION RESTORED")
         }
         _uiState.update { state ->
             val prevMountStatus = state.mountStatus
@@ -622,7 +676,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private suspend fun queryRawMotorPositionsInternal() {
-        val nowMs = System.currentTimeMillis()
+        val nowMs = SystemClock.elapsedRealtime()
         try {
             val raRx = usbConnection.transactSafe(NexStarProtocol.GET_RA_MC_POS, timeoutMs = 2000)
             val raPosHex = NexStarProtocol.parseRawMotorPosition(raRx) ?: "------"
@@ -665,6 +719,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 lastDecTimeMs = nowMs
             }
 
+            engineeringLogger.record("ENCODER", motorCoordinator.currentIntent.generation,
+                "ra=$raPosHex dec=$decPosHex measuredRa=$measuredRa measuredDec=$measuredDec")
             verifyUncommandedMotionAndStopVerification(measuredRa, measuredDec)
 
             _uiState.update {
@@ -677,6 +733,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            engineeringLogger.record("ERROR", motorCoordinator.currentIntent.generation, "raw encoder query failed: ${e.message}")
         }
     }
 
@@ -768,6 +825,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setSlewRate(rate: Int) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "slewRate=$rate")
         if (rate in 1..9 && !_uiState.value.isSlewing) {
             log("Manual slew rate changed to $rate")
             _uiState.update { it.copy(slewRate = rate) }
@@ -777,6 +835,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     // --- MANUAL VECTOR TRACKING & DESIRED MOTOR STATE COORDINATION ---
 
     private suspend fun setTrackingChecked(mode: TrackingMode, epoch: Long, generation: Long = motorCoordinator.currentIntent.generation) {
+        engineeringLogger.record("TRACKING", generation, "requested=${mode.label} epoch=$epoch")
         val rx = usbConnection.transactSafe(NexStarProtocol.setTrackingModeCommand(mode), writeGate = { write ->
             motorCoordinator.admitWrite(generation, extraCheck = {
                 epoch == controlEpoch && !shuttingDown && (mode == TrackingMode.OFF ||
@@ -786,6 +845,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             }, write = write)
         })
         if (rx.size != 1 || rx[0] != '#'.code.toByte()) throw IOException("Invalid tracking acknowledgement")
+        engineeringLogger.record("TRACKING", generation, "acknowledged=${mode.label}")
     }
 
     private suspend fun readFreshEncoderPair(): Pair<Int, Int>? {
@@ -820,6 +880,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun toggleManualTrack(enabled: Boolean) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "manualTrack=$enabled")
         if (!usbConnection.isConnected() || !_uiState.value.isAvxReady || shuttingDown || stopPending || trackingSetupPending) return
         trackingSetupPending = true
         val epoch = ++controlEpoch
@@ -909,6 +970,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun adjustBackgroundRa(delta: Double) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "adjustBackgroundRa=$delta")
         if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update {
@@ -919,6 +981,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun adjustBackgroundDec(delta: Double) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "adjustBackgroundDec=$delta")
         if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update {
@@ -929,6 +992,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun zeroBackgroundRa() {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "zeroBackgroundRa")
         if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update { it.copy(backgroundRaArcsecPerSec = 0.0) }
@@ -936,6 +1000,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun zeroBackgroundDec() {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "zeroBackgroundDec")
         if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update { it.copy(backgroundDecArcsecPerSec = 0.0) }
@@ -943,6 +1008,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun zeroBackgroundBoth() {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "zeroBackgroundBoth")
         if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update {
@@ -955,6 +1021,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setTrackStep(step: Double) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "trackStep=$step")
         _uiState.update { it.copy(trackStep = step) }
     }
 
@@ -1003,6 +1070,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         val highSpeedWarning = abs(state.backgroundRaArcsecPerSec) > 3600.0 || abs(state.backgroundDecArcsecPerSec) > 3600.0
 
         val newIntent = motorCoordinator.updateDesiredState(raDesired, decDesired, reason)
+        engineeringLogger.record("BACKGROUND", newIntent.generation, "tracking=${state.trackingMode} backgroundRa=${state.backgroundRaArcsecPerSec} backgroundDec=${state.backgroundDecArcsecPerSec}")
 
         _uiState.update {
             it.copy(
@@ -1019,6 +1087,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     // --- DIRECTIONAL SLEW CONTROLS ---
 
     fun startManualSlew(axis: SlewAxis, direction: SlewDirection) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "slewPress axis=$axis direction=$direction")
         if (!usbConnection.isConnected() || !_uiState.value.isAvxReady || shuttingDown || stopPending || trackingSetupPending) return
         val epoch = ++controlEpoch
         val needsTrackingOff = !_uiState.value.manualTrackEnabled && _uiState.value.slewRate >= 3 && _uiState.value.trackingMode != TrackingMode.OFF
@@ -1079,6 +1148,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun stopManualSlew(axis: SlewAxis) {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "slewRelease axis=$axis")
         if (!usbConnection.isConnected()) return
         if (trackingSetupPending && pendingSlewAxis != null && axis != pendingSlewAxis) return
         if ((axis == SlewAxis.RA && raOverride == null) ||
@@ -1111,6 +1181,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun stopAll() {
+        engineeringLogger.record("INPUT", motorCoordinator.currentIntent.generation, "stopAll requested")
         if (stopPending || shuttingDown) return
         stopPending = true
         controlEpoch++
@@ -1148,6 +1219,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             val ackStatus = motorCoordinator.emergencyStop("EMERGENCY_STOP")
             previousSafetyJob?.join()
             _uiState.update { it.copy(stopDiagnosticStatus = ackStatus) }
+            engineeringLogger.record("STATUS", motorCoordinator.currentIntent.generation, "stop=$ackStatus")
             stopPending = false
 
             // Emergency stop never restarts native tracking.
@@ -1174,6 +1246,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             raOverride = null
             decOverride = null
             log("Disconnected.")
+            engineeringLogger.endSession(resetIntent.generation, "user disconnect")
             if (!cleared) shuttingDown = false
             _uiState.update {
                 it.copy(
@@ -1181,6 +1254,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     handControllerStatus = HandControllerStatus.DISCONNECTED,
                     mountStatus = MountStatus.UNKNOWN,
                     trackingMode = TrackingMode.UNKNOWN,
+                    lastHeartbeatWallMillis = null,
+                    lastHeartbeatElapsedMillis = null,
                     status = "DISCONNECTED",
                     error = null,
                     isSlewing = false,
@@ -1292,6 +1367,18 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun snapshotEngineeringLog(callback: (Result<String>) -> Unit) {
+        engineeringLogger.snapshot(callback)
+    }
+
+    fun reportEngineeringLogError(message: String) {
+        _uiState.update { it.copy(engineeringLogError = message) }
+    }
+
+    fun clearEngineeringLogError() {
+        _uiState.update { it.copy(engineeringLogError = null) }
+    }
+
     fun clearError() {
         _uiState.update { it.copy(error = null) }
     }
@@ -1310,6 +1397,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             previousSafetyJob?.join()
             if (usbConnection.isConnected()) motorCoordinator.emergencyStop("VIEWMODEL_CLEARED")
             motorCoordinator.closeConnection()
+            engineeringLogger.endSession(motorCoordinator.currentIntent.generation, "view model cleared")
+            engineeringLogger.close()
             safetyScope.cancel()
         }
     }

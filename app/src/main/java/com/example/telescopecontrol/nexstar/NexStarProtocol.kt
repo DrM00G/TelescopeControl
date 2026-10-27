@@ -156,6 +156,13 @@ object NexStarProtocol {
         )
     }
 
+    /** Guide-family stop uses the two-byte zero payload, independently of variableSlew. */
+    fun guideZero(axis: SlewAxis, direction: SlewDirection): ByteArray = byteArrayOf(
+        0x50, 0x03, axis.deviceId.toByte(),
+        (if (direction == SlewDirection.POSITIVE) 0x06 else 0x07).toByte(),
+        0, 0, 0, 0
+    )
+
     /**
      * Celestron 24-bit variable-rate pass-through slew packet (8 bytes).
      * 'P', 4, device, command, HIGH, MID, LOW, 0

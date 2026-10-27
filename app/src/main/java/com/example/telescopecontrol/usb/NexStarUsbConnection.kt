@@ -23,6 +23,15 @@ class NexStarUsbConnection(
     @Volatile private var port: UsbSerialPort? = null
     private val transactionMutex = Mutex()
 
+    /** Called at physical I/O boundaries, including partial reads and failed writes. */
+    @Volatile var wireLogger: ((String, Long, ByteArray, String?) -> Unit)? = null
+    /** Snapshot at transaction admission; guarded movement writes replace this at physical TX. */
+    @Volatile var generationProvider: (() -> Long)? = null
+
+    private fun trace(direction: String, generation: Long, bytes: ByteArray, detail: String? = null) {
+        try { wireLogger?.invoke(direction, generation, bytes, detail) } catch (_: Exception) { /* Diagnostics must not affect motor safety. */ }
+    }
+
     /**
      * Finds all drivers recognized by usb-serial-for-android.
      */
@@ -125,8 +134,18 @@ class NexStarUsbConnection(
             // Some drivers may not support this.
         }
 
-        if (writeGate == null) serialPort.write(command, 1000)
-        else writeGate { serialPort.write(command, 50) }
+        var transactionGeneration = generationProvider?.invoke() ?: 0L
+        val write = {
+            transactionGeneration = generationProvider?.invoke() ?: 0L
+            try {
+                serialPort.write(command, if (writeGate == null) 1000 else 50)
+                trace("TX", transactionGeneration, command)
+            } catch (e: Exception) {
+                trace("TX_ERROR", transactionGeneration, command, e.message)
+                throw e
+            }
+        }
+        if (writeGate == null) write() else writeGate(write)
 
         // Binary replies may contain '#'. Their protocol-defined payload length, not
         // the first delimiter byte, determines the end of the response.
@@ -140,32 +159,54 @@ class NexStarUsbConnection(
         }
         val response = mutableListOf<Byte>()
         val buffer = ByteArray(64)
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
 
-        while (System.currentTimeMillis() < deadline) {
-            val remaining = deadline - System.currentTimeMillis()
+        while (System.nanoTime() < deadline) {
+            val remaining = (deadline - System.nanoTime() + 999_999L) / 1_000_000L
             if (remaining <= 0) {
                 break
             }
 
             val readTimeout = minOf(remaining, 500L).toInt()
-            val count = serialPort.read(buffer, readTimeout)
+            val count = try {
+                serialPort.read(buffer, readTimeout)
+            } catch (e: Exception) {
+                trace("RX_ERROR", transactionGeneration, response.toByteArray(), e.message)
+                throw e
+            }
 
             if (count > 0) {
+                trace("RX", transactionGeneration, buffer.copyOf(count))
                 for (i in 0 until count) {
                     val value = buffer[i]
                     response.add(value)
                     if (expectedLength != null && response.size == expectedLength) {
-                        if (value != '#'.code.toByte()) throw IOException("Invalid NexStar response terminator")
+                        if (i != count - 1) {
+                            trace("RX_ERROR", transactionGeneration, buffer.copyOfRange(i + 1, count), "unexpected trailing bytes")
+                            throw IOException("Unexpected trailing NexStar response bytes")
+                        }
+                        if (value != '#'.code.toByte()) {
+                            trace("RX_ERROR", transactionGeneration, response.toByteArray(), "invalid response terminator")
+                            throw IOException("Invalid NexStar response terminator")
+                        }
                         return response.toByteArray()
                     }
                     if (expectedLength == null && value == '#'.code.toByte()) {
+                        if (i != count - 1) {
+                            trace("RX_ERROR", transactionGeneration, buffer.copyOfRange(i + 1, count), "unexpected trailing bytes")
+                            throw IOException("Unexpected trailing NexStar response bytes")
+                        }
                         return response.toByteArray()
+                    }
+                    if (response.size > 256) {
+                        trace("RX_ERROR", transactionGeneration, response.toByteArray(), "response too long")
+                        throw IOException("NexStar response too long")
                     }
                 }
             }
         }
 
+        trace("RX_ERROR", transactionGeneration, response.toByteArray(), "timeout")
         throw IOException(
             "Timed out waiting for NexStar response terminator '#'. " +
                     "Received ${response.size} bytes."

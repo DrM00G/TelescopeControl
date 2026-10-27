@@ -15,6 +15,15 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.TelescopeControl">
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.engineeringlogs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/engineering_log_paths" />
+        </provider>
         <activity
             android:name=".MainActivity"
             android:exported="true"

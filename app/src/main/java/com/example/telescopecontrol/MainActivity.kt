@@ -2,6 +2,8 @@ package com.example.telescopecontrol
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -9,6 +11,10 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -58,11 +64,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.example.telescopecontrol.model.DesiredAxisState
 import com.example.telescopecontrol.model.HandControllerStatus
 import com.example.telescopecontrol.model.MountStatus
@@ -71,6 +79,11 @@ import com.example.telescopecontrol.model.SlewDirection
 import com.example.telescopecontrol.model.StopDiagnosticStatus
 import com.example.telescopecontrol.ui.theme.TelescopeControlTheme
 import java.util.Locale
+import java.util.Date
+import java.text.SimpleDateFormat
+import kotlinx.coroutines.delay
+import java.io.File
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
 
@@ -177,6 +190,17 @@ fun TelescopeControlScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val scrollState = rememberScrollState()
+    val context = LocalContext.current
+    var clockMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    var clockElapsed by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            clockMillis = System.currentTimeMillis()
+            clockElapsed = SystemClock.elapsedRealtime()
+            delay(1000)
+        }
+    }
+    val clockFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS XXX", Locale.US) }
 
     Column(
         modifier = modifier
@@ -187,7 +211,7 @@ fun TelescopeControlScreen(
     ) {
         // App Title
         Text(
-            text = "AVX CONTROLLER v0.3.2",
+            text = "AVX CONTROLLER v0.3.3",
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold
         )
@@ -243,13 +267,13 @@ fun TelescopeControlScreen(
 
                     val mountColor = when (state.mountStatus) {
                         MountStatus.ONLINE -> Color(0xFF2E7D32)
-                        MountStatus.PARTIAL -> Color(0xFFF57C00)
+                        MountStatus.PARTIAL, MountStatus.SUSPECT -> Color(0xFFF57C00)
                         MountStatus.OFFLINE -> Color(0xFFD32F2F)
                         MountStatus.UNKNOWN -> Color.Gray
                     }
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(text = "AVX Power: ", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                        Text(text = "Motor link: ", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                         Text(
                             text = state.mountStatus.name,
                             color = mountColor,
@@ -917,6 +941,68 @@ fun TelescopeControlScreen(
 
                 if (diagnosticsExpanded) {
                     Spacer(modifier = Modifier.height(8.dp))
+                    Text("Engineering clock: ${clockFormat.format(Date(clockMillis))}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                    val lastWall = state.lastHeartbeatWallMillis
+                    val lastElapsed = state.lastHeartbeatElapsedMillis
+                    Text(
+                        if (lastWall == null || lastElapsed == null) "Last successful heartbeat: never"
+                        else "Last successful heartbeat: ${clockFormat.format(Date(lastWall))} (${((clockElapsed - lastElapsed).coerceAtLeast(0) / 1000)}s ago)",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    state.engineeringLogError?.let { error ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(error, color = MaterialTheme.colorScheme.error, modifier = Modifier.weight(1f))
+                            TextButton(onClick = { viewModel.clearEngineeringLogError() }) { Text("Dismiss") }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        TextButton(onClick = {
+                            viewModel.snapshotEngineeringLog { result ->
+                                Handler(Looper.getMainLooper()).post {
+                                    result.fold(onSuccess = { text ->
+                                        try {
+                                            (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                                                .setPrimaryClip(ClipData.newPlainText("Engineering session log", text))
+                                            Toast.makeText(context, "Engineering log copied", Toast.LENGTH_SHORT).show()
+                                        } catch (e: Exception) { viewModel.reportEngineeringLogError("Copy failed: ${e.message}") }
+                                    }, onFailure = { viewModel.reportEngineeringLogError("Copy failed: ${it.message}") })
+                                }
+                            }
+                        }) { Text("Copy full log") }
+                        TextButton(onClick = {
+                            viewModel.snapshotEngineeringLog { result ->
+                                result.fold(onSuccess = { text ->
+                                    try {
+                                        val dir = File(context.cacheDir, "engineering_exports")
+                                        if (!dir.exists() && !dir.mkdirs()) error("Cannot create export directory")
+                                        // Keep recent exports available for recipients that open them later.
+                                        dir.listFiles()?.filter { it.isFile && it.name.startsWith("engineering-session-") }
+                                            ?.sortedByDescending { it.lastModified() }?.drop(9)
+                                            ?.forEach { if (!it.delete()) viewModel.reportEngineeringLogError("Unable to remove old export ${it.name}") }
+                                        val file = File(dir, "engineering-session-${UUID.randomUUID()}.log")
+                                        file.writeText(text, Charsets.UTF_8)
+                                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.engineeringlogs", file)
+                                        Handler(Looper.getMainLooper()).post {
+                                            try {
+                                                val intent = Intent(Intent.ACTION_SEND).apply {
+                                                    type = "text/plain"
+                                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                                    clipData = ClipData.newRawUri("Engineering session log", uri)
+                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                }
+                                                val chooser = Intent.createChooser(intent, "Share engineering log").apply {
+                                                    clipData = ClipData.newRawUri("Engineering session log", uri)
+                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                }
+                                                context.startActivity(chooser)
+                                            } catch (e: Exception) { viewModel.reportEngineeringLogError("Share failed: ${e.message}") }
+                                        }
+                                    } catch (e: Exception) { viewModel.reportEngineeringLogError("Share failed: ${e.message}") }
+                                }, onFailure = { viewModel.reportEngineeringLogError("Share failed: ${it.message}") })
+                            }
+                        }) { Text("Share log") }
+                    }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),

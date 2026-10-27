@@ -23,7 +23,7 @@ class HeartbeatPolicy {
             return Result(MountStatus.PARTIAL, 0, false, true, false)
         }
         completeFailures++
-        return if (completeFailures == 1) Result(previous, 0, false, true, false)
+        return if (completeFailures == 1) Result(MountStatus.SUSPECT, 0, false, true, false)
         else Result(MountStatus.OFFLINE, 0, false, false, true)
     }
 }

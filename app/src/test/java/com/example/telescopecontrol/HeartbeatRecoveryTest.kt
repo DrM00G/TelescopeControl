@@ -35,10 +35,14 @@ class HeartbeatRecoveryTest {
     }
     private fun motor(fake: Fake) = MotorCommandCoordinator(fake, { _, _ -> }, {}, {})
     private fun stops() = listOf(
-        NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.POSITIVE, 0).toList(),
-        NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.NEGATIVE, 0).toList(),
-        NexStarProtocol.fixedSlew(SlewAxis.DEC, SlewDirection.POSITIVE, 0).toList(),
-        NexStarProtocol.fixedSlew(SlewAxis.DEC, SlewDirection.NEGATIVE, 0).toList())
+        listOf<Byte>(0x50, 3, 0x10, 6, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x10, 7, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x10, 0x24, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x10, 0x25, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x11, 6, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x11, 7, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x11, 0x24, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x11, 0x25, 0, 0, 0, 0))
 
     @Test fun failedFirstStopAndRepeatedFailureStayUnknownUntilFreshRecovery() = runBlocking {
         val fake = Fake(); val motor = motor(fake); val recovery = HeartbeatRecovery(motor)
@@ -54,7 +58,7 @@ class HeartbeatRecoveryTest {
         assertFalse(returned.heartbeat.ready)
         assertEquals(StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED, returned.stopStatus)
         assertEquals(stops() + stops(), fake.packets)
-        assertEquals(List(8) { 250L }, fake.timeouts)
+        assertEquals(List(16) { 250L }, fake.timeouts)
         assertTrue(recovery.needsStopOnRecovery)
         val verified = recovery.record(true, true, MountStatus.ONLINE, verifyStationary = { true })
         assertEquals(StopDiagnosticStatus.STOP_VERIFIED, verified.stopStatus)
@@ -62,6 +66,19 @@ class HeartbeatRecoveryTest {
         assertFalse(recovery.record(true, true, MountStatus.ONLINE).heartbeat.ready)
         assertTrue(recovery.record(true, true, MountStatus.ONLINE).heartbeat.ready)
         assertEquals(DesiredAxisState.Stop, motor.currentIntent.ra)
+    }
+
+    @Test fun failureIsPublishedBeforePendingStopCompletes() = runBlocking {
+        val fake = Fake(); fake.pause = CompletableDeferred()
+        val motor = motor(fake); val recovery = HeartbeatRecovery(motor)
+        var status: MountStatus? = null
+        val pending = async { recovery.record(false, false, MountStatus.ONLINE, onFailure = { status = it.status }) }
+        fake.entered.await()
+        assertEquals(MountStatus.SUSPECT, status)
+        assertFalse(pending.isCompleted)
+        fake.pause!!.complete(Unit); fake.pause = null
+        pending.await()
+        Unit
     }
 
     @Test fun startupReadinessRequiresExactlyTwoHeartbeatsWithoutRecoveryStop() = runBlocking {
@@ -120,15 +137,15 @@ class HeartbeatRecoveryTest {
     @Test fun failedRecoveryRetriesOnlyOnNextHeartbeatAndNeverResumes() = runBlocking {
         val fake = Fake(); val motor = motor(fake); val recovery = HeartbeatRecovery(motor)
         recovery.record(false, false, MountStatus.ONLINE)
-        fake.badPacket = 6
+        fake.badPacket = 10
         val failed = recovery.record(true, true, MountStatus.ONLINE)
         assertEquals(StopDiagnosticStatus.STOP_REQUESTED, failed.stopStatus)
         assertFalse(failed.heartbeat.ready); assertTrue(recovery.needsStopOnRecovery)
         assertEquals(null to null, motor.appliedStates())
-        assertEquals(8, fake.packets.size)
+        assertEquals(16, fake.packets.size)
         fake.badPacket = null
         recovery.record(true, true, MountStatus.ONLINE)
-        assertEquals(12, fake.packets.size)
+        assertEquals(24, fake.packets.size)
         assertEquals(DesiredAxisState.Stop, motor.currentIntent.dec)
     }
 

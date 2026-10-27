@@ -41,11 +41,16 @@ class MandatoryMotorScenariosTest {
         NexStarProtocol.fixedSlew(axis, direction, rate).toList()
     private fun variablePacket(axis: SlewAxis, rate: Double) = NexStarProtocol.variableSlew(axis, rate).toList()
     private fun stops() = listOf(
-        fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
-        fixedPacket(SlewAxis.RA, SlewDirection.NEGATIVE, 0),
-        fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0),
-        fixedPacket(SlewAxis.DEC, SlewDirection.NEGATIVE, 0)
+        listOf<Byte>(0x50, 3, 0x10, 6, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x10, 7, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x10, 0x24, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x10, 0x25, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x11, 6, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x11, 7, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x11, 0x24, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x11, 0x25, 0, 0, 0, 0)
     )
+    private fun axisStops(axis: SlewAxis) = if (axis == SlewAxis.RA) stops().take(4) else stops().drop(4)
     private fun motor(fake: Fake) = MotorCommandCoordinator(fake, { _, _ -> }, {}, {})
 
     @Test fun staleDec420BlockedBeforePhysicalWrite() = runBlocking {
@@ -58,10 +63,7 @@ class MandatoryMotorScenariosTest {
         motor.updateDesiredState(stop, stop, "dec stop")
         release.complete(Unit)
         yield()
-        assertEquals(listOf(
-            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
-            fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0)
-        ), fake.packets)
+        assertEquals(axisStops(SlewAxis.RA) + axisStops(SlewAxis.DEC), fake.packets)
         assertEquals(stop, motor.currentIntent.dec)
         motor.stopWorker()
     }
@@ -83,13 +85,10 @@ class MandatoryMotorScenariosTest {
         fake.afterWrite = null
         release.complete(Unit)
         yield()
-        assertEquals(listOf(
-            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
+        assertEquals(axisStops(SlewAxis.RA) + axisStops(SlewAxis.DEC) + listOf(
             fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 4),
-            fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0),
-            fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0),
             fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0)
-        ), fake.packets)
+        ) + axisStops(SlewAxis.DEC), fake.packets)
         assertFalse(fake.packets.contains(variablePacket(SlewAxis.DEC, 240.0)))
         motor.stopWorker()
     }
@@ -111,7 +110,7 @@ class MandatoryMotorScenariosTest {
         release.complete(Unit)
         assertEquals(StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED, emergency.await())
         yield()
-        assertEquals(listOf(fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0)) + stops() + listOf(variablePacket(SlewAxis.RA, 60.0)), fake.packets)
+        assertEquals(axisStops(SlewAxis.RA) + axisStops(SlewAxis.DEC) + stops() + listOf(variablePacket(SlewAxis.RA, 60.0)), fake.packets)
         assertEquals(newer, motor.currentIntent)
         motor.stopWorker()
     }
@@ -123,10 +122,11 @@ class MandatoryMotorScenariosTest {
         yield()
         motor.updateDesiredState(variable(60.0), fixed(SlewDirection.NEGATIVE), "release ra")
         yield()
-        assertEquals(listOf(
-            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 4),
+        assertEquals(axisStops(SlewAxis.RA) + listOf(fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 4)) +
+            axisStops(SlewAxis.DEC) + listOf(
             fixedPacket(SlewAxis.DEC, SlewDirection.NEGATIVE, 4),
             fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
+            fixedPacket(SlewAxis.RA, SlewDirection.NEGATIVE, 0),
             variablePacket(SlewAxis.RA, 60.0)
         ), fake.packets)
         assertEquals(fixed(SlewDirection.NEGATIVE), motor.currentIntent.dec)
@@ -145,10 +145,7 @@ class MandatoryMotorScenariosTest {
         motor.updateDesiredState(stop, stop, "zero")
         release.complete(Unit)
         yield()
-        assertEquals(listOf(
-            fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0),
-            fixedPacket(SlewAxis.DEC, SlewDirection.POSITIVE, 0)
-        ), fake.packets)
+        assertEquals(axisStops(SlewAxis.RA) + axisStops(SlewAxis.DEC), fake.packets)
         assertEquals(stop, motor.currentIntent.ra)
         motor.stopWorker()
     }
@@ -162,11 +159,11 @@ class MandatoryMotorScenariosTest {
         assertTrue(policy.record(true, true, MountStatus.ONLINE).ready)
         val result = policy.record(false, false, MountStatus.ONLINE)
         assertTrue(result.stop); assertFalse(result.quiet); assertFalse(result.ready)
-        assertEquals(MountStatus.ONLINE, result.status)
+        assertEquals(MountStatus.SUSPECT, result.status)
         val intent = motor.invalidateForStop("HEARTBEAT_FAILURE")
         assertEquals(stop, motor.currentIntent.ra); assertEquals(stop, motor.currentIntent.dec)
         assertEquals(StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED, motor.stopIfCurrent(intent, 250))
-        assertEquals(listOf(variablePacket(SlewAxis.RA, 60.0), variablePacket(SlewAxis.DEC, 420.0)) + stops(), fake.packets)
+        assertEquals(axisStops(SlewAxis.RA) + listOf(variablePacket(SlewAxis.RA, 60.0)) + axisStops(SlewAxis.DEC) + listOf(variablePacket(SlewAxis.DEC, 420.0)) + stops(), fake.packets)
         assertEquals(intent, motor.currentIntent)
         motor.stopWorker()
     }
@@ -186,7 +183,7 @@ class MandatoryMotorScenariosTest {
         motor.markAppliedUnknownIfCurrent(invalidated.generation)
         assertTrue(invalidated.generation > stopIntent.generation)
         assertEquals(stop, invalidated.ra); assertEquals(stop, invalidated.dec)
-        assertEquals(listOf(fixedPacket(SlewAxis.RA, SlewDirection.POSITIVE, 0), variablePacket(SlewAxis.DEC, 420.0)) + stops(), fake.packets)
+        assertEquals(axisStops(SlewAxis.RA) + axisStops(SlewAxis.DEC) + listOf(variablePacket(SlewAxis.DEC, 420.0)) + stops(), fake.packets)
         motor.stopWorker()
     }
 }

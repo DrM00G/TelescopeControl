@@ -17,6 +17,7 @@ import kotlinx.coroutines.yield
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException
+import java.util.Collections
 
 class MotorSafetyTest {
     private class Fake : MotorTransport {
@@ -38,19 +39,23 @@ class MotorSafetyTest {
     }
     private fun coordinator(fake: Fake) = MotorCommandCoordinator(fake, { _, _ -> }, {}, {})
     private fun stops() = listOf(
-        NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.POSITIVE, 0).toList(),
-        NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.NEGATIVE, 0).toList(),
-        NexStarProtocol.fixedSlew(SlewAxis.DEC, SlewDirection.POSITIVE, 0).toList(),
-        NexStarProtocol.fixedSlew(SlewAxis.DEC, SlewDirection.NEGATIVE, 0).toList()
+        listOf<Byte>(0x50, 3, 0x10, 6, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x10, 7, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x10, 0x24, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x10, 0x25, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x11, 6, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 3, 0x11, 7, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x11, 0x24, 0, 0, 0, 0),
+        listOf<Byte>(0x50, 2, 0x11, 0x25, 0, 0, 0, 0)
     )
 
     @Test fun firstCompleteFailureStopsPhysically() = runBlocking {
         val policy = HeartbeatPolicy(); val fake = Fake(); val motor = coordinator(fake)
         val result = policy.record(false, false, MountStatus.ONLINE)
-        assertFalse(result.ready); assertTrue(result.stop); assertEquals(MountStatus.ONLINE, result.status)
+        assertFalse(result.ready); assertTrue(result.stop); assertEquals(MountStatus.SUSPECT, result.status)
         val intent = motor.invalidateForStop("heartbeat")
         assertEquals(StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED, motor.stopIfCurrent(intent, 250))
-        assertEquals(stops(), fake.packets); assertEquals(listOf(250L, 250L, 250L, 250L), fake.timeouts)
+        assertEquals(stops(), fake.packets); assertEquals(List(8) { 250L }, fake.timeouts)
         assertEquals(DesiredAxisState.Stop, motor.currentIntent.ra)
     }
 
@@ -101,6 +106,34 @@ class MotorSafetyTest {
         val stopped = async(start = CoroutineStart.UNDISPATCHED) { motor.stopIfCurrent(stop, 250) }
         assertEquals(StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED, stopped.await())
         assertEquals(stops(), fake.packets)
+        motor.stopWorker()
+    }
+
+    @Test fun concurrentPublicationsAreLoggedBeforeConflationInGenerationOrder() {
+        val fake = Fake()
+        val published = Collections.synchronizedList(mutableListOf<Long>())
+        val motor = MotorCommandCoordinator(fake, { _, _ -> }, {}, {}, onIntentPublished = { published.add(it.generation) })
+        val threads = List(8) { thread -> Thread {
+            repeat(100) { motor.updateDesiredState(DesiredAxisState.Stop, DesiredAxisState.Stop, "thread-$thread") }
+        } }
+        threads.forEach { it.start() }; threads.forEach { it.join() }
+        assertEquals((1L..800L).toList(), published)
+    }
+
+    @Test fun staleWriteIsLoggedAtRejectionNotAsApplicationFailure() = runBlocking {
+        val fake = Fake(); fake.pause = CompletableDeferred()
+        val errors = mutableListOf<String>()
+        val discards = mutableListOf<Triple<Long, Long, String>>()
+        val motor = MotorCommandCoordinator(fake, { message, error -> if (error) errors.add(message) }, {}, {},
+            onDiscarded = { generation, current, reason -> discards.add(Triple(generation, current, reason)) })
+        motor.start(this)
+        val move = motor.updateDesiredState(DesiredAxisState.Fixed(SlewDirection.POSITIVE, 2), DesiredAxisState.Stop, "slew")
+        fake.entered.await()
+        val stop = motor.invalidateForStop("superseded")
+        fake.pause!!.complete(Unit); fake.pause = null
+        yield()
+        assertEquals(listOf(Triple(move.generation, stop.generation, "write gate")), discards)
+        assertTrue(errors.isEmpty())
         motor.stopWorker()
     }
 

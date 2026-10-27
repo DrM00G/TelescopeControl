@@ -1,0 +1,9 @@
+package com.example.telescopecontrol.model
+
+enum class StopDiagnosticStatus(val label: String) {
+    NONE("None"),
+    STOP_REQUESTED("STOP REQUESTED"),
+    STOP_COMMANDS_ACKNOWLEDGED("STOP COMMANDS ACKNOWLEDGED"),
+    STOP_VERIFIED("STOP VERIFIED"),
+    STOP_ACKNOWLEDGED_BUT_MOTION_CONTINUES("STOP ACKNOWLEDGED BUT MOTION CONTINUES")
+}

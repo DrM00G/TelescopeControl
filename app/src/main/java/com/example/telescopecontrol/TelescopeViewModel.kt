@@ -24,6 +24,11 @@ import com.example.telescopecontrol.nexstar.toPrintableAscii
 import com.example.telescopecontrol.usb.NexStarUsbConnection
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import android.os.SystemClock
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,6 +86,10 @@ data class TelescopeUiState(
     val slewRate: Int = 2,
     val activeSlewAxis: SlewAxis? = null,
     val activeSlewDirection: SlewDirection? = null,
+    val activeRaDirection: SlewDirection? = null,
+    val activeDecDirection: SlewDirection? = null,
+    val desiredRa: DesiredAxisState = DesiredAxisState.Stop,
+    val desiredDec: DesiredAxisState = DesiredAxisState.Stop,
     val isSlewing: Boolean = false,
     // v0.3 / v0.3.2 fields
     val isAvxReady: Boolean = false,
@@ -116,11 +125,21 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         logger = { msg, isErr -> log(msg, isErr) },
         onErrorWarning = { warn ->
             _uiState.update { it.copy(alignmentWarning = warn) }
-        }
+        },
+        onMovementFailure = { safetyScope.launch { stopAll() } }
     )
 
     private val travelEnvelope = MountTravelEnvelope()
 
+    // Outlives viewModelScope so lifecycle shutdown can finish before closing the port.
+    private val safetyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var safetyJob: Job? = null
+    @Volatile private var controlEpoch = 0L
+    @Volatile private var shuttingDown = false
+    private var cleared = false
+    private var stopPending = false
+    private var trackingSetupPending = false
+    private var pendingSlewAxis: SlewAxis? = null
     private var pollJob: Job? = null
     private var heartbeatJob: Job? = null
     private var preSlewTrackingMode: TrackingMode? = null
@@ -257,6 +276,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun openDriverConnection(driver: UsbSerialDriver) {
+        if (shuttingDown || cleared || usbConnection.isConnected()) return
         log("Opening port for device ${driver.device.deviceName}...")
         try {
             usbConnection.open(driver)
@@ -287,12 +307,21 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun onUsbDeviceDetached() {
         log("USB device detached / disconnected physically.")
+        controlEpoch++
         pollJob?.cancel()
         heartbeatJob?.cancel()
-        val resetIntent = motorCoordinator.resetStatesQuietly()
+        shuttingDown = true
+        val resetIntent = motorCoordinator.invalidateForDisconnect()
+        val detachEpoch = controlEpoch
+        val previousSafetyJob = safetyJob
+        safetyJob = safetyScope.launch {
+            previousSafetyJob?.join()
+            motorCoordinator.closeConnection()
+            motorCoordinator.resetAppliedIfCurrent(resetIntent.generation)
+            if (!cleared && controlEpoch == detachEpoch) shuttingDown = false
+        }
         raOverride = null
         decOverride = null
-        usbConnection.close()
         _uiState.update {
             it.copy(
                 connected = false,
@@ -302,6 +331,10 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 isSlewing = false,
                 activeSlewAxis = null,
                 activeSlewDirection = null,
+                activeRaDirection = null,
+                activeDecDirection = null,
+                desiredRa = DesiredAxisState.Stop,
+                desiredDec = DesiredAxisState.Stop,
                 isAvxReady = false,
                 consecutiveHeartbeats = 0,
                 manualTrackEnabled = false,
@@ -460,6 +493,20 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             else -> MountStatus.OFFLINE
         }
 
+        val previousState = _uiState.value
+        val prevMountStatus = previousState.mountStatus
+        if (prevMountStatus == MountStatus.ONLINE && newMountStatus == MountStatus.OFFLINE) {
+            log("AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING", isError = true)
+        } else if (prevMountStatus == MountStatus.OFFLINE && newMountStatus == MountStatus.ONLINE) {
+            log("AVX POWER RESTORED")
+        }
+        if (newMountStatus == MountStatus.OFFLINE) {
+            if (previousState.manualTrackEnabled) log("Mount offline: Manual Track disabled and velocities reset to 0.", isError = true)
+            controlEpoch++
+            motorCoordinator.resetStatesQuietly()
+            raOverride = null
+            decOverride = null
+        }
         _uiState.update { state ->
             val prevMountStatus = state.mountStatus
             var updatedTrust = state.alignmentTrust
@@ -469,10 +516,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             val newIsAvxReady = newHeartbeatCount >= 2 && newMountStatus == MountStatus.ONLINE
 
             if (prevMountStatus == MountStatus.ONLINE && newMountStatus == MountStatus.OFFLINE) {
-                log("AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING", isError = true)
                 warning = "AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING"
             } else if (prevMountStatus == MountStatus.OFFLINE && newMountStatus == MountStatus.ONLINE) {
-                log("AVX POWER RESTORED")
                 updatedTrust = AlignmentTrust.STALE_AFTER_POWER_LOSS
                 warning = "AVX POWER RESTORED — Alignment is stale"
             }
@@ -482,15 +527,9 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             var bgDec = state.backgroundDecArcsecPerSec
 
             if (newMountStatus == MountStatus.OFFLINE) {
-                if (isManualTrack) {
-                    log("Mount offline: Manual Track disabled and velocities reset to 0.", isError = true)
-                }
                 isManualTrack = false
                 bgRa = 0.0
                 bgDec = 0.0
-                motorCoordinator.resetStatesQuietly()
-                raOverride = null
-                decOverride = null
             }
 
             state.copy(
@@ -591,7 +630,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     measuredDecArcsecPerSec = measuredDec
                 )
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
         }
     }
 
@@ -627,14 +667,6 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
 
-        val isStationary = abs(measuredRa) < 1.0 && abs(measuredDec) < 1.0
-        val currentStopStatus = currentState.stopDiagnosticStatus
-
-        // Update STOP VERIFIED status if stationary while tracking is OFF
-        if (isStationary && (currentStopStatus == StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED || currentStopStatus == StopDiagnosticStatus.STOP_REQUESTED)) {
-            _uiState.update { it.copy(stopDiagnosticStatus = StopDiagnosticStatus.STOP_VERIFIED) }
-            log("STOP VERIFIED: Encoder measurements confirm stationary motors.", false)
-        }
 
         // Uncommanded motion check when expected stationary
         var raUncommanded = false
@@ -673,9 +705,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 log("SAFETY WARN: $warningMsg. Initiating single emergency STOP retry...", isError = true)
                 if (raUncommanded) hasRetriedStopForRa = true
                 if (decUncommanded) hasRetriedStopForDec = true
-                viewModelScope.launch {
-                    motorCoordinator.emergencyStop("UNCOMMANDED_MOTION_RETRY")
-                }
+                stopAll()
             }
         } else {
             _uiState.update { it.copy(uncommandedMotionWarning = null) }
@@ -701,19 +731,73 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
 
     // --- MANUAL VECTOR TRACKING & DESIRED MOTOR STATE COORDINATION ---
 
-    fun toggleManualTrack(enabled: Boolean) {
-        if (!usbConnection.isConnected() || !_uiState.value.isAvxReady) return
+    private suspend fun setTrackingChecked(mode: TrackingMode, epoch: Long, generation: Long = motorCoordinator.currentIntent.generation) {
+        val rx = usbConnection.transactSafe(NexStarProtocol.setTrackingModeCommand(mode), writeGate = { write ->
+            motorCoordinator.admitWrite(generation, extraCheck = {
+                epoch == controlEpoch && !shuttingDown && (mode == TrackingMode.OFF ||
+                    (_uiState.value.trackingMode == TrackingMode.OFF &&
+                        motorCoordinator.currentIntent.ra is DesiredAxisState.Stop &&
+                        motorCoordinator.currentIntent.dec is DesiredAxisState.Stop))
+            }, write = write)
+        })
+        if (rx.size != 1 || rx[0] != '#'.code.toByte()) throw IOException("Invalid tracking acknowledgement")
+    }
 
-        viewModelScope.launch {
+    private suspend fun readFreshEncoderPair(): Pair<Int, Int>? {
+        val ra = NexStarProtocol.parseRawMotorPosition(usbConnection.transactSafe(NexStarProtocol.GET_RA_MC_POS, 1000))?.toIntOrNull(16)
+        val dec = NexStarProtocol.parseRawMotorPosition(usbConnection.transactSafe(NexStarProtocol.GET_DEC_MC_POS, 1000))?.toIntOrNull(16)
+        return if (ra != null && dec != null) ra to dec else null
+    }
+
+    private suspend fun verifyFreshStop(generation: Long, epoch: Long): Boolean {
+        fun stillSafe(): Boolean = usbConnection.isConnected() && !shuttingDown && epoch == controlEpoch &&
+            _uiState.value.trackingMode == TrackingMode.OFF && motorCoordinator.currentIntent.generation == generation &&
+            motorCoordinator.currentIntent.ra is DesiredAxisState.Stop && motorCoordinator.currentIntent.dec is DesiredAxisState.Stop
+        return try {
+            if (!stillSafe()) return false
+            val first = readFreshEncoderPair() ?: return false
+            val start = SystemClock.elapsedRealtime()
+            delay(1000)
+            if (!stillSafe()) return false
+            val second = readFreshEncoderPair() ?: return false
+            val elapsed = (SystemClock.elapsedRealtime() - start) / 1000.0
+            fun velocity(a: Int, b: Int): Double {
+                var delta = b - a
+                if (delta > 8388607) delta -= 16777216
+                if (delta < -8388608) delta += 16777216
+                return abs(delta * 1296000.0 / 16777216.0 / elapsed)
+            }
+            elapsed > 0 && stillSafe() && velocity(first.first, second.first) < 1.0 && velocity(first.second, second.second) < 1.0
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            false
+        }
+    }
+
+    fun toggleManualTrack(enabled: Boolean) {
+        if (!usbConnection.isConnected() || !_uiState.value.isAvxReady || shuttingDown || stopPending || trackingSetupPending) return
+        trackingSetupPending = true
+        val epoch = ++controlEpoch
+
+        safetyJob = safetyScope.launch {
+            try {
             if (enabled) {
+                motorCoordinator.updateDesiredState(DesiredAxisState.Stop, DesiredAxisState.Stop, "MANUAL_TRACK_ENABLE_PENDING")
                 val currentTracking = _uiState.value.trackingMode
                 log("MANUAL TRACK ON requested. Saving current Celestron tracking mode: ${currentTracking.label}")
 
                 try {
-                    usbConnection.transactSafe(NexStarProtocol.setTrackingModeCommand(TrackingMode.OFF))
+                    setTrackingChecked(TrackingMode.OFF, epoch)
+                    if (epoch != controlEpoch || !usbConnection.isConnected()) {
+                        _uiState.update { it.copy(trackingMode = TrackingMode.UNKNOWN) }
+                        return@launch
+                    }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
+                    if (epoch != controlEpoch) return@launch
                     log("Failed to turn off Celestron tracking: ${e.message}", isError = true)
+                    _uiState.update { it.copy(manualTrackEnabled = false, trackingMode = TrackingMode.UNKNOWN, error = "Tracking OFF was not acknowledged") }
+                    return@launch
                 }
 
                 _uiState.update {
@@ -741,6 +825,10 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                         isSlewing = false,
                         activeSlewAxis = null,
                         activeSlewDirection = null,
+                activeRaDirection = null,
+                activeDecDirection = null,
+                desiredRa = DesiredAxisState.Stop,
+                desiredDec = DesiredAxisState.Stop,
                         stopDiagnosticStatus = StopDiagnosticStatus.STOP_REQUESTED
                     )
                 }
@@ -748,46 +836,36 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 decOverride = null
 
                 // C. Send authoritative Emergency STOP sequence
-                val stopAck = motorCoordinator.emergencyStop("MANUAL_TRACK_TOGGLE_OFF")
+                var stopGeneration = -1L
+                val stopAck = motorCoordinator.emergencyStop("MANUAL_TRACK_TOGGLE_OFF") { stopGeneration = it }
                 _uiState.update { it.copy(stopDiagnosticStatus = stopAck) }
-
-                // D. While Celestron tracking is still OFF, verify measured motor velocity settles near zero
-                var verifiedStop = false
-                val startTime = System.currentTimeMillis()
-                while (System.currentTimeMillis() - startTime < 3000L && isActive) {
-                    queryRawMotorPositionsInternal()
-                    val mRa = _uiState.value.measuredRaArcsecPerSec
-                    val mDec = _uiState.value.measuredDecArcsecPerSec
-                    if (abs(mRa) < 1.0 && abs(mDec) < 1.0) {
-                        verifiedStop = true
-                        log("MANUAL TRACK OFF: Confirmed physical motion stopped near 0\"/s.", false)
-                        _uiState.update { it.copy(stopDiagnosticStatus = StopDiagnosticStatus.STOP_VERIFIED) }
-                        break
-                    }
-                    delay(300)
+                val verified = stopAck == StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED &&
+                    epoch == controlEpoch && verifyFreshStop(stopGeneration, epoch)
+                if (!verified) {
+                    log("MANUAL TRACK OFF: STOP not verified; tracking will not be restored.", true)
+                    return@launch
                 }
-
-                if (!verifiedStop) {
-                    log("MANUAL TRACK OFF WARN: Physical motion did not fully settle near zero before timeout.", isError = true)
-                }
-
-                // E. Only after verified STOP (or timeout), restore saved Celestron tracking mode
-                if (savedMode != null && savedMode != TrackingMode.OFF) {
-                    log("Restoring saved Celestron tracking mode: ${savedMode.label}")
+                _uiState.update { it.copy(stopDiagnosticStatus = StopDiagnosticStatus.STOP_VERIFIED) }
+                if (savedMode != null && savedMode != TrackingMode.OFF && savedMode != TrackingMode.UNKNOWN) {
                     try {
-                        usbConnection.transactSafe(NexStarProtocol.setTrackingModeCommand(savedMode))
-                        _uiState.update { it.copy(trackingMode = savedMode) }
+                        setTrackingChecked(savedMode, epoch, stopGeneration)
+                        if (epoch == controlEpoch) _uiState.update { it.copy(trackingMode = savedMode) }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
-                        log("Error restoring tracking mode: ${e.message}", isError = true)
+                        _uiState.update { it.copy(trackingMode = TrackingMode.UNKNOWN, error = "Tracking restore failed") }
+                        log("Error restoring tracking mode: ${e.message}", true)
                     }
                 }
-                // F. Zero-motion verification automatically disables once native tracking resumes (trackingMode != OFF)
+            }
+            } finally {
+                trackingSetupPending = false
             }
         }
     }
 
     fun adjustBackgroundRa(delta: Double) {
+        if (trackingSetupPending || shuttingDown || stopPending) return
+        controlEpoch++
         _uiState.update {
             val newRa = (it.backgroundRaArcsecPerSec + delta).coerceIn(-14400.0, 14400.0)
             it.copy(backgroundRaArcsecPerSec = newRa)
@@ -796,6 +874,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun adjustBackgroundDec(delta: Double) {
+        if (trackingSetupPending || shuttingDown || stopPending) return
+        controlEpoch++
         _uiState.update {
             val newDec = (it.backgroundDecArcsecPerSec + delta).coerceIn(-14400.0, 14400.0)
             it.copy(backgroundDecArcsecPerSec = newDec)
@@ -804,16 +884,22 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun zeroBackgroundRa() {
+        if (trackingSetupPending || shuttingDown || stopPending) return
+        controlEpoch++
         _uiState.update { it.copy(backgroundRaArcsecPerSec = 0.0) }
         recalculateAndApplyDesiredStates("ZERO_BACKGROUND")
     }
 
     fun zeroBackgroundDec() {
+        if (trackingSetupPending || shuttingDown || stopPending) return
+        controlEpoch++
         _uiState.update { it.copy(backgroundDecArcsecPerSec = 0.0) }
         recalculateAndApplyDesiredStates("ZERO_BACKGROUND")
     }
 
     fun zeroBackgroundBoth() {
+        if (trackingSetupPending || shuttingDown || stopPending) return
+        controlEpoch++
         _uiState.update {
             it.copy(
                 backgroundRaArcsecPerSec = 0.0,
@@ -828,6 +914,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun recalculateAndApplyDesiredStates(reason: String) {
+        if (shuttingDown || stopPending) return
         val state = _uiState.value
         val manualRate = state.slewRate
         val isManualTrack = state.manualTrackEnabled
@@ -860,12 +947,12 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         val commandedRa = when (raDesired) {
             is DesiredAxisState.Stop -> 0.0
             is DesiredAxisState.Variable -> raDesired.arcsecPerSec
-            is DesiredAxisState.Fixed -> if (raDesired.direction == SlewDirection.POSITIVE) manualRate * 15.0 else -manualRate * 15.0
+            is DesiredAxisState.Fixed -> 0.0
         }
         val commandedDec = when (decDesired) {
             is DesiredAxisState.Stop -> 0.0
             is DesiredAxisState.Variable -> decDesired.arcsecPerSec
-            is DesiredAxisState.Fixed -> if (decDesired.direction == SlewDirection.POSITIVE) manualRate * 15.0 else -manualRate * 15.0
+            is DesiredAxisState.Fixed -> 0.0
         }
 
         val highSpeedWarning = abs(state.backgroundRaArcsecPerSec) > 3600.0 || abs(state.backgroundDecArcsecPerSec) > 3600.0
@@ -876,6 +963,8 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             it.copy(
                 commandedRaArcsecPerSec = commandedRa,
                 commandedDecArcsecPerSec = commandedDec,
+                desiredRa = raDesired,
+                desiredDec = decDesired,
                 highSpeedBackgroundWarning = highSpeedWarning,
                 motorGeneration = newIntent.generation
             )
@@ -885,7 +974,13 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     // --- DIRECTIONAL SLEW CONTROLS ---
 
     fun startManualSlew(axis: SlewAxis, direction: SlewDirection) {
-        if (!usbConnection.isConnected() || !_uiState.value.isAvxReady) return
+        if (!usbConnection.isConnected() || !_uiState.value.isAvxReady || shuttingDown || stopPending || trackingSetupPending) return
+        val epoch = ++controlEpoch
+        val needsTrackingOff = !_uiState.value.manualTrackEnabled && _uiState.value.slewRate >= 3 && _uiState.value.trackingMode != TrackingMode.OFF
+        if (needsTrackingOff) {
+            trackingSetupPending = true
+            pendingSlewAxis = axis
+        }
 
         if (axis == SlewAxis.RA) {
             raOverride = direction
@@ -897,11 +992,14 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             it.copy(
                 isSlewing = true,
                 activeSlewAxis = axis,
-                activeSlewDirection = direction
+                activeSlewDirection = direction,
+                activeRaDirection = raOverride,
+                activeDecDirection = decOverride
             )
         }
 
         viewModelScope.launch {
+            try {
             if (!_uiState.value.manualTrackEnabled) {
                 val rate = _uiState.value.slewRate
                 val currentTracking = _uiState.value.trackingMode
@@ -909,20 +1007,38 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     preSlewTrackingMode = currentTracking
                     log("Rate $rate >= 3: Temporarily disabling tracking (${currentTracking.label})...")
                     try {
-                        usbConnection.transactSafe(NexStarProtocol.setTrackingModeCommand(TrackingMode.OFF))
+                        setTrackingChecked(TrackingMode.OFF, epoch)
+                        if (epoch != controlEpoch) {
+                            _uiState.update { it.copy(trackingMode = TrackingMode.UNKNOWN) }
+                            return@launch
+                        }
                         _uiState.update { it.copy(trackingMode = TrackingMode.OFF) }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
+                        if (epoch != controlEpoch) return@launch
+                        _uiState.update { it.copy(trackingMode = TrackingMode.UNKNOWN) }
                         log("Failed to disable tracking for slew: ${e.message}", isError = true)
+                        stopAll()
+                        return@launch
                     }
                 }
             }
-            recalculateAndApplyDesiredStates("MANUAL_PRESS")
+            if (epoch == controlEpoch) recalculateAndApplyDesiredStates("MANUAL_PRESS")
+            } finally {
+                if (needsTrackingOff) {
+                    trackingSetupPending = false
+                    pendingSlewAxis = null
+                }
+            }
         }
     }
 
     fun stopManualSlew(axis: SlewAxis) {
         if (!usbConnection.isConnected()) return
+        if (trackingSetupPending && pendingSlewAxis != null && axis != pendingSlewAxis) return
+        if ((axis == SlewAxis.RA && raOverride == null) ||
+            (axis == SlewAxis.DEC && decOverride == null)) return
+        controlEpoch++
 
         if (axis == SlewAxis.RA) {
             raOverride = null
@@ -930,33 +1046,32 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             decOverride = null
         }
 
-        val activeAxis = _uiState.value.activeSlewAxis
-        val remainingActive = if (activeAxis == axis) null else activeAxis
+        val remainingActive = when { raOverride != null -> SlewAxis.RA; decOverride != null -> SlewAxis.DEC; else -> null }
 
         _uiState.update {
             it.copy(
                 isSlewing = remainingActive != null,
                 activeSlewAxis = remainingActive,
-                activeSlewDirection = if (remainingActive != null) it.activeSlewDirection else null
+                activeSlewDirection = if (remainingActive == SlewAxis.RA) raOverride else decOverride,
+                activeRaDirection = raOverride,
+                activeDecDirection = decOverride
             )
         }
 
-        viewModelScope.launch {
-            val reason = if (_uiState.value.manualTrackEnabled) {
-                "MANUAL_RELEASE_RETURN_TO_BACKGROUND"
-            } else {
-                "MANUAL_RELEASE"
-            }
-            recalculateAndApplyDesiredStates(reason)
-
-            if (!_uiState.value.manualTrackEnabled && remainingActive == null) {
-                restoreTrackingIfNeeded()
-            }
-        }
+        val reason = if (_uiState.value.manualTrackEnabled) "MANUAL_RELEASE_RETURN_TO_BACKGROUND" else "MANUAL_RELEASE"
+        recalculateAndApplyDesiredStates(reason)
+        // Ordinary slew release deliberately leaves native tracking off: restoring it
+        // requires a fresh acknowledged four-packet stop and encoder verification.
+        // The manual-track-off path performs that sequence; release does not.
     }
 
     fun stopAll() {
-        viewModelScope.launch {
+        if (stopPending || shuttingDown) return
+        stopPending = true
+        controlEpoch++
+        motorCoordinator.updateDesiredState(DesiredAxisState.Stop, DesiredAxisState.Stop, "STOP_PENDING")
+        val previousSafetyJob = safetyJob
+        safetyJob = safetyScope.launch {
             log("TX STOP ALL (Global Emergency Stop)")
 
             raOverride = null
@@ -969,6 +1084,10 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     isSlewing = false,
                     activeSlewAxis = null,
                     activeSlewDirection = null,
+                activeRaDirection = null,
+                activeDecDirection = null,
+                desiredRa = DesiredAxisState.Stop,
+                desiredDec = DesiredAxisState.Stop,
                     commandedRaArcsecPerSec = 0.0,
                     commandedDecArcsecPerSec = 0.0,
                     highSpeedBackgroundWarning = false,
@@ -982,46 +1101,35 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
             hasRetriedStopForDec = false
 
             val ackStatus = motorCoordinator.emergencyStop("EMERGENCY_STOP")
+            previousSafetyJob?.join()
             _uiState.update { it.copy(stopDiagnosticStatus = ackStatus) }
+            stopPending = false
 
-            if (!_uiState.value.manualTrackEnabled) {
-                restoreTrackingIfNeeded()
-            }
-        }
-    }
-
-    private suspend fun restoreTrackingIfNeeded() {
-        val restoreMode = preSlewTrackingMode
-        if (restoreMode != null && restoreMode != TrackingMode.OFF) {
-            log("Restoring tracking mode to ${restoreMode.label}...")
-            try {
-                usbConnection.transactSafe(NexStarProtocol.setTrackingModeCommand(restoreMode))
-                _uiState.update { it.copy(trackingMode = restoreMode) }
-            } catch (e: Exception) {
-                if (e !is CancellationException) {
-                    log("Failed to restore tracking mode: ${e.message}", isError = true)
-                    _uiState.update { it.copy(error = "Failed to restore tracking: ${e.message}") }
-                }
-            } finally {
-                preSlewTrackingMode = null
-            }
+            // Emergency stop never restarts native tracking.
         }
     }
 
     fun disconnect() {
+        if (shuttingDown) return
         log("Disconnecting...")
         pollJob?.cancel()
         heartbeatJob?.cancel()
 
-        viewModelScope.launch {
+        shuttingDown = true
+        controlEpoch++
+        motorCoordinator.updateDesiredState(DesiredAxisState.Stop, DesiredAxisState.Stop, "DISCONNECT_PENDING")
+        val previousSafetyJob = safetyJob
+        safetyJob = safetyScope.launch {
+            previousSafetyJob?.join()
             if (usbConnection.isConnected()) {
                 motorCoordinator.emergencyStop("USER_DISCONNECT")
             }
-            usbConnection.close()
+            motorCoordinator.closeConnection()
             val resetIntent = motorCoordinator.resetStatesQuietly()
             raOverride = null
             decOverride = null
             log("Disconnected.")
+            if (!cleared) shuttingDown = false
             _uiState.update {
                 it.copy(
                     connected = false,
@@ -1146,12 +1254,17 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
         super.onCleared()
         pollJob?.cancel()
         heartbeatJob?.cancel()
+        cleared = true
+        shuttingDown = true
+        controlEpoch++
+        motorCoordinator.updateDesiredState(DesiredAxisState.Stop, DesiredAxisState.Stop, "CLEAR_PENDING")
         motorCoordinator.stopWorker()
-        if (usbConnection.isConnected()) {
-            viewModelScope.launch {
-                motorCoordinator.emergencyStop("VIEWMODEL_CLEARED")
-                usbConnection.close()
-            }
+        val previousSafetyJob = safetyJob
+        safetyScope.launch {
+            previousSafetyJob?.join()
+            if (usbConnection.isConnected()) motorCoordinator.emergencyStop("VIEWMODEL_CLEARED")
+            motorCoordinator.closeConnection()
+            safetyScope.cancel()
         }
     }
 

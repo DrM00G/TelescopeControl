@@ -63,6 +63,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.example.telescopecontrol.model.DesiredAxisState
 import com.example.telescopecontrol.model.HandControllerStatus
 import com.example.telescopecontrol.model.MountStatus
 import com.example.telescopecontrol.model.SlewAxis
@@ -465,12 +466,12 @@ fun TelescopeControlScreen(
 
                             Text("Commanded / Desired", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             Text(
-                                "RA:  %+.1f\"/s".format(Locale.US, state.commandedRaArcsecPerSec),
+                                "RA:  ${when (val desired = state.desiredRa) { is DesiredAxisState.Fixed -> "FIXED RATE ${desired.rate} ${desired.direction}"; else -> "%+.1f\"/s".format(Locale.US, state.commandedRaArcsecPerSec) }}",
                                 fontSize = 11.sp,
                                 fontFamily = FontFamily.Monospace
                             )
                             Text(
-                                "DEC: %+.1f\"/s".format(Locale.US, state.commandedDecArcsecPerSec),
+                                "DEC: ${when (val desired = state.desiredDec) { is DesiredAxisState.Fixed -> "FIXED RATE ${desired.rate} ${desired.direction}"; else -> "%+.1f\"/s".format(Locale.US, state.commandedDecArcsecPerSec) }}",
                                 fontSize = 11.sp,
                                 fontFamily = FontFamily.Monospace
                             )
@@ -786,7 +787,7 @@ fun TelescopeControlScreen(
                     axis = SlewAxis.DEC,
                     direction = SlewDirection.POSITIVE,
                     enabled = isManualControlsEnabled,
-                    isCurrentlyActive = state.isSlewing && state.activeSlewAxis == SlewAxis.DEC && state.activeSlewDirection == SlewDirection.POSITIVE,
+                    isCurrentlyActive = state.activeDecDirection == SlewDirection.POSITIVE,
                     onSlewStart = { a, d -> viewModel.startManualSlew(a, d) },
                     onSlewStop = { a -> viewModel.stopManualSlew(a) },
                     modifier = Modifier.width(140.dp)
@@ -804,7 +805,7 @@ fun TelescopeControlScreen(
                     axis = SlewAxis.RA,
                     direction = SlewDirection.NEGATIVE,
                     enabled = isManualControlsEnabled,
-                    isCurrentlyActive = state.isSlewing && state.activeSlewAxis == SlewAxis.RA && state.activeSlewDirection == SlewDirection.NEGATIVE,
+                    isCurrentlyActive = state.activeRaDirection == SlewDirection.NEGATIVE,
                     onSlewStart = { a, d -> viewModel.startManualSlew(a, d) },
                     onSlewStop = { a -> viewModel.stopManualSlew(a) },
                     modifier = Modifier
@@ -838,7 +839,7 @@ fun TelescopeControlScreen(
                     axis = SlewAxis.RA,
                     direction = SlewDirection.POSITIVE,
                     enabled = isManualControlsEnabled,
-                    isCurrentlyActive = state.isSlewing && state.activeSlewAxis == SlewAxis.RA && state.activeSlewDirection == SlewDirection.POSITIVE,
+                    isCurrentlyActive = state.activeRaDirection == SlewDirection.POSITIVE,
                     onSlewStart = { a, d -> viewModel.startManualSlew(a, d) },
                     onSlewStop = { a -> viewModel.stopManualSlew(a) },
                     modifier = Modifier
@@ -857,7 +858,7 @@ fun TelescopeControlScreen(
                     axis = SlewAxis.DEC,
                     direction = SlewDirection.NEGATIVE,
                     enabled = isManualControlsEnabled,
-                    isCurrentlyActive = state.isSlewing && state.activeSlewAxis == SlewAxis.DEC && state.activeSlewDirection == SlewDirection.NEGATIVE,
+                    isCurrentlyActive = state.activeDecDirection == SlewDirection.NEGATIVE,
                     onSlewStart = { a, d -> viewModel.startManualSlew(a, d) },
                     onSlewStop = { a -> viewModel.stopManualSlew(a) },
                     modifier = Modifier.width(140.dp)

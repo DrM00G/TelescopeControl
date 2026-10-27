@@ -11,10 +11,13 @@ import com.example.telescopecontrol.usb.NexStarUsbConnection
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
@@ -28,15 +31,20 @@ import kotlin.math.abs
 class MotorCommandCoordinator(
     private val usbConnection: NexStarUsbConnection,
     private val logger: (message: String, isError: Boolean) -> Unit,
-    private val onErrorWarning: (warning: String) -> Unit
+    private val onErrorWarning: (warning: String) -> Unit,
+    private val onMovementFailure: () -> Unit
 ) {
     private val _motorIntent = AtomicReference(MotorIntent())
+    // Generation publication and the physical write share this gate.
+    private val generationLock = Any()
+    private class StaleMovementException : IOException("Movement generation superseded")
 
     private var currentAppliedRaState: DesiredAxisState = DesiredAxisState.Stop
     private var currentAppliedDecState: DesiredAxisState = DesiredAxisState.Stop
 
     private val stateChannel = Channel<MotorIntent>(Channel.CONFLATED)
     private var workerJob: Job? = null
+    private var workerScope: CoroutineScope? = null
 
     // High-level coordinator mutex protecting complete movement application sequences
     private val movementMutex = Mutex()
@@ -46,6 +54,7 @@ class MotorCommandCoordinator(
 
     fun start(scope: CoroutineScope) {
         stopWorker()
+        workerScope = scope
         workerJob = scope.launch {
             runMotorWorker()
         }
@@ -65,15 +74,13 @@ class MotorCommandCoordinator(
         decState: DesiredAxisState,
         reason: String
     ): MotorIntent {
-        val newIntent = _motorIntent.updateAndGet { current ->
-            MotorIntent(
-                generation = current.generation + 1,
-                ra = raState,
-                dec = decState,
-                reason = reason
-            )
+        val newIntent = synchronized(generationLock) {
+            val next = _motorIntent.updateAndGet { current ->
+                MotorIntent(current.generation + 1, raState, decState, reason)
+            }
+            stateChannel.trySend(next)
+            next
         }
-        stateChannel.trySend(newIntent)
         return newIntent
     }
 
@@ -81,19 +88,28 @@ class MotorCommandCoordinator(
      * Resets internal applied state tracking without transmitting over USB.
      * Useful on USB disconnect or mount power loss.
      */
-    fun resetStatesQuietly(): MotorIntent {
-        val resetIntent = _motorIntent.updateAndGet { current ->
-            MotorIntent(
-                generation = current.generation + 1,
-                ra = DesiredAxisState.Stop,
-                dec = DesiredAxisState.Stop,
-                reason = "POWER_LOSS_OR_DISCONNECT"
-            )
-        }
-        currentAppliedRaState = DesiredAxisState.Stop
-        currentAppliedDecState = DesiredAxisState.Stop
-        while (stateChannel.tryReceive().isSuccess) {}
+    suspend fun resetStatesQuietly(): MotorIntent {
+        val resetIntent = invalidateForDisconnect()
+        resetAppliedIfCurrent(resetIntent.generation)
         return resetIntent
+    }
+
+    fun invalidateForDisconnect(): MotorIntent = synchronized(generationLock) {
+        _motorIntent.updateAndGet { current ->
+            MotorIntent(current.generation + 1, DesiredAxisState.Stop, DesiredAxisState.Stop, "POWER_LOSS_OR_DISCONNECT")
+        }
+    }
+
+    suspend fun resetAppliedIfCurrent(generation: Long) = movementMutex.withLock {
+        if (_motorIntent.get().generation == generation) {
+            currentAppliedRaState = DesiredAxisState.Stop
+            currentAppliedDecState = DesiredAxisState.Stop
+        }
+    }
+
+    /** Serializes closing with every complete emergency stop and movement sequence. */
+    suspend fun closeConnection() = withContext(NonCancellable) {
+        movementMutex.withLock { usbConnection.closeSafely() }
     }
 
     /**
@@ -101,32 +117,26 @@ class MotorCommandCoordinator(
      * Atomically increments generation, sets intent to Stop, acquires movementMutex,
      * and sends 4 physical STOP packets (POS 0 and NEG 0 for both RA and DEC).
      */
-    suspend fun emergencyStop(reason: String): StopDiagnosticStatus {
-        val stopIntent = _motorIntent.updateAndGet { current ->
+    suspend fun emergencyStop(reason: String, onGeneration: (Long) -> Unit = {}): StopDiagnosticStatus {
+        val stopIntent = synchronized(generationLock) { _motorIntent.updateAndGet { current ->
             MotorIntent(
                 generation = current.generation + 1,
                 ra = DesiredAxisState.Stop,
                 dec = DesiredAxisState.Stop,
                 reason = reason
             )
-        }
+        } }
 
-        // Drain any pending worker signals
-        while (stateChannel.tryReceive().isSuccess) {}
-
+        onGeneration(stopIntent.generation)
+        // Stale queued signals are rejected by their generation; do not drain a newer intent.
         logger("GEN ${stopIntent.generation} requested STOP ($reason)", false)
 
-        return movementMutex.withLock {
-            val currentGen = _motorIntent.get().generation
-            if (stopIntent.generation != currentGen) {
-                logger("GEN ${stopIntent.generation} DISCARDED — current generation $currentGen", false)
-                return@withLock StopDiagnosticStatus.NONE
-            }
-
+        return withContext(NonCancellable) { movementMutex.withLock {
             if (!usbConnection.isConnected()) {
-                currentAppliedRaState = DesiredAxisState.Stop
-                currentAppliedDecState = DesiredAxisState.Stop
-                return@withLock StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED
+                val warning = "SAFETY WARNING: STOP unavailable — USB connection lost; physical motor state unknown"
+                logger(warning, true)
+                onErrorWarning(warning)
+                return@withLock StopDiagnosticStatus.STOP_UNAVAILABLE_CONNECTION_LOST
             }
 
             var stopFailed = false
@@ -137,7 +147,7 @@ class MotorCommandCoordinator(
                 val rx = usbConnection.transactSafe(raPosBytes)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP RA POS:\nTX ${raPosBytes.toHexString()}\nRX: $rxStr", false)
-                if (rx.isEmpty() || rx.last() != '#'.code.toByte()) stopFailed = true
+                if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 logger("EMERGENCY STOP RA POS FAILED: ${e.message}", true)
@@ -150,7 +160,7 @@ class MotorCommandCoordinator(
                 val rx = usbConnection.transactSafe(raNegBytes)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP RA NEG:\nTX ${raNegBytes.toHexString()}\nRX: $rxStr", false)
-                if (rx.isEmpty() || rx.last() != '#'.code.toByte()) stopFailed = true
+                if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 logger("EMERGENCY STOP RA NEG FAILED: ${e.message}", true)
@@ -163,7 +173,7 @@ class MotorCommandCoordinator(
                 val rx = usbConnection.transactSafe(decPosBytes)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP DEC POS:\nTX ${decPosBytes.toHexString()}\nRX: $rxStr", false)
-                if (rx.isEmpty() || rx.last() != '#'.code.toByte()) stopFailed = true
+                if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 logger("EMERGENCY STOP DEC POS FAILED: ${e.message}", true)
@@ -176,7 +186,7 @@ class MotorCommandCoordinator(
                 val rx = usbConnection.transactSafe(decNegBytes)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP DEC NEG:\nTX ${decNegBytes.toHexString()}\nRX: $rxStr", false)
-                if (rx.isEmpty() || rx.last() != '#'.code.toByte()) stopFailed = true
+                if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 logger("EMERGENCY STOP DEC NEG FAILED: ${e.message}", true)
@@ -195,6 +205,14 @@ class MotorCommandCoordinator(
                 logger("GEN ${stopIntent.generation} applied STOP", false)
                 StopDiagnosticStatus.STOP_COMMANDS_ACKNOWLEDGED
             }
+        } }
+    }
+
+    /** The write completes before a newer generation can be published. */
+    fun admitWrite(generation: Long, extraCheck: () -> Boolean = { true }, write: () -> Unit) {
+        synchronized(generationLock) {
+            if (_motorIntent.get().generation != generation || !extraCheck()) throw StaleMovementException()
+            write()
         }
     }
 
@@ -216,6 +234,10 @@ class MotorCommandCoordinator(
                     val ok = applySingleAxisState(SlewAxis.RA, currentAppliedRaState, intent.ra, intent.generation, intent.reason)
                     if (ok) {
                         currentAppliedRaState = intent.ra
+                    } else if (_motorIntent.get().generation == intent.generation) {
+                        onErrorWarning("RA movement command failed; issuing emergency STOP")
+                        launchEmergencyStop()
+                        return@withLock
                     }
                 }
 
@@ -231,10 +253,24 @@ class MotorCommandCoordinator(
                     val ok = applySingleAxisState(SlewAxis.DEC, currentAppliedDecState, intent.dec, intent.generation, intent.reason)
                     if (ok) {
                         currentAppliedDecState = intent.dec
+                    } else if (_motorIntent.get().generation == intent.generation) {
+                        onErrorWarning("DEC movement command failed; issuing emergency STOP")
+                        launchEmergencyStop()
                     }
                 }
             }
         }
+    }
+
+    private fun launchEmergencyStop() {
+        onMovementFailure()
+    }
+
+    private suspend fun movementTransaction(command: ByteArray, generation: Long) {
+        val response = usbConnection.transactSafe(command, writeGate = { write ->
+            admitWrite(generation, write = write)
+        })
+        if (response.size != 1 || response[0] != '#'.code.toByte()) throw IOException("Invalid movement acknowledgement")
     }
 
     private suspend fun applySingleAxisState(
@@ -249,27 +285,27 @@ class MotorCommandCoordinator(
             // If previously in Fixed slew and transitioning out, send explicit rate-0 STOP first
             if (prevApplied is DesiredAxisState.Fixed && newTarget !is DesiredAxisState.Fixed) {
                 val stopBytes = NexStarProtocol.fixedSlew(axis, SlewDirection.POSITIVE, 0)
-                usbConnection.transactSafe(stopBytes)
+                movementTransaction(stopBytes, generation)
             }
 
             when (newTarget) {
                 is DesiredAxisState.Stop -> {
                     val stopBytes = NexStarProtocol.fixedSlew(axis, SlewDirection.POSITIVE, 0)
-                    usbConnection.transactSafe(stopBytes)
+                    movementTransaction(stopBytes, generation)
                 }
                 is DesiredAxisState.Variable -> {
                     val rate = newTarget.arcsecPerSec
                     if (abs(rate) < 0.01) {
                         val stopBytes = NexStarProtocol.fixedSlew(axis, SlewDirection.POSITIVE, 0)
-                        usbConnection.transactSafe(stopBytes)
+                        movementTransaction(stopBytes, generation)
                     } else {
                         val varBytes = NexStarProtocol.variableSlew(axis, rate)
-                        usbConnection.transactSafe(varBytes)
+                        movementTransaction(varBytes, generation)
                     }
                 }
                 is DesiredAxisState.Fixed -> {
                     val fixedBytes = NexStarProtocol.fixedSlew(axis, newTarget.direction, newTarget.rate)
-                    usbConnection.transactSafe(fixedBytes)
+                    movementTransaction(fixedBytes, generation)
                 }
             }
             logger("GEN $generation applied ${newTarget.toLogString()}", false)

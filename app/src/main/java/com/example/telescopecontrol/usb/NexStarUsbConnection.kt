@@ -3,6 +3,7 @@ package com.example.telescopecontrol.usb
 import android.content.Context
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import com.example.telescopecontrol.nexstar.NexStarProtocol
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
@@ -19,7 +20,7 @@ class NexStarUsbConnection(
     private val usbManager =
         context.getSystemService(Context.USB_SERVICE) as UsbManager
 
-    private var port: UsbSerialPort? = null
+    @Volatile private var port: UsbSerialPort? = null
     private val transactionMutex = Mutex()
 
     /**
@@ -78,7 +79,11 @@ class NexStarUsbConnection(
         port = selectedPort
     }
 
-    fun close() {
+    suspend fun closeSafely() = transactionMutex.withLock {
+        withContext(Dispatchers.IO) { close() }
+    }
+
+    private fun close() {
         try {
             port?.close()
         } catch (_: Exception) {
@@ -96,17 +101,19 @@ class NexStarUsbConnection(
      */
     suspend fun transactSafe(
         command: ByteArray,
-        timeoutMs: Long = 4000
+        timeoutMs: Long = 4000,
+        writeGate: ((() -> Unit) -> Unit)? = null
     ): ByteArray = transactionMutex.withLock {
         withContext(Dispatchers.IO) {
-            transact(command, timeoutMs)
+            transact(command, timeoutMs, writeGate)
         }
     }
 
     @Throws(IOException::class)
     private fun transact(
         command: ByteArray,
-        timeoutMs: Long = 4000
+        timeoutMs: Long = 4000,
+        writeGate: ((() -> Unit) -> Unit)? = null
     ): ByteArray {
         val serialPort = port
             ?: throw IOException("USB serial port is not connected.")
@@ -118,8 +125,19 @@ class NexStarUsbConnection(
             // Some drivers may not support this.
         }
 
-        serialPort.write(command, 1000)
+        if (writeGate == null) serialPort.write(command, 1000)
+        else writeGate { serialPort.write(command, 50) }
 
+        // Binary replies may contain '#'. Their protocol-defined payload length, not
+        // the first delimiter byte, determines the end of the response.
+        val expectedLength = when {
+            command.contentEquals(NexStarProtocol.GET_VERSION) -> 3
+            command.contentEquals(NexStarProtocol.GET_ALIGNMENT_STATUS) -> 2
+            command.contentEquals(NexStarProtocol.GET_TRACKING_MODE) -> 2
+            command.size == 8 && command[0] == 'P'.code.toByte() -> (command[7].toInt() and 0xff) + 1
+            command.contentEquals(NexStarProtocol.ECHO_TEST) -> 2
+            else -> null
+        }
         val response = mutableListOf<Byte>()
         val buffer = ByteArray(64)
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -137,7 +155,11 @@ class NexStarUsbConnection(
                 for (i in 0 until count) {
                     val value = buffer[i]
                     response.add(value)
-                    if (value == '#'.code.toByte()) {
+                    if (expectedLength != null && response.size == expectedLength) {
+                        if (value != '#'.code.toByte()) throw IOException("Invalid NexStar response terminator")
+                        return response.toByteArray()
+                    }
+                    if (expectedLength == null && value == '#'.code.toByte()) {
                         return response.toByteArray()
                     }
                 }

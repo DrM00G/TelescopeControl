@@ -15,7 +15,7 @@ import java.io.IOException
 
 class NexStarUsbConnection(
     private val context: Context
-) {
+) : MotorTransport {
 
     private val usbManager =
         context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -79,7 +79,7 @@ class NexStarUsbConnection(
         port = selectedPort
     }
 
-    suspend fun closeSafely() = transactionMutex.withLock {
+    override suspend fun closeSafely() = transactionMutex.withLock {
         withContext(Dispatchers.IO) { close() }
     }
 
@@ -92,17 +92,17 @@ class NexStarUsbConnection(
         }
     }
 
-    fun isConnected(): Boolean {
+    override fun isConnected(): Boolean {
         return port != null
     }
 
     /**
      * Thread-safe transaction wrapper to guarantee single-transaction-at-a-time execution off UI thread.
      */
-    suspend fun transactSafe(
+    override suspend fun transactSafe(
         command: ByteArray,
-        timeoutMs: Long = 4000,
-        writeGate: ((() -> Unit) -> Unit)? = null
+        timeoutMs: Long,
+        writeGate: ((() -> Unit) -> Unit)?
     ): ByteArray = transactionMutex.withLock {
         withContext(Dispatchers.IO) {
             transact(command, timeoutMs, writeGate)

@@ -7,7 +7,7 @@ import com.example.telescopecontrol.model.SlewDirection
 import com.example.telescopecontrol.model.StopDiagnosticStatus
 import com.example.telescopecontrol.nexstar.NexStarProtocol
 import com.example.telescopecontrol.nexstar.toHexString
-import com.example.telescopecontrol.usb.NexStarUsbConnection
+import com.example.telescopecontrol.usb.MotorTransport
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -29,7 +29,7 @@ import kotlin.math.abs
  * to guarantee latest-state-wins and prevent stale or interleaved commands.
  */
 class MotorCommandCoordinator(
-    private val usbConnection: NexStarUsbConnection,
+    private val usbConnection: MotorTransport,
     private val logger: (message: String, isError: Boolean) -> Unit,
     private val onErrorWarning: (warning: String) -> Unit,
     private val onMovementFailure: () -> Unit
@@ -117,6 +117,10 @@ class MotorCommandCoordinator(
      * Atomically increments generation, sets intent to Stop, acquires movementMutex,
      * and sends 4 physical STOP packets (POS 0 and NEG 0 for both RA and DEC).
      */
+    fun invalidateForStop(reason: String): MotorIntent = synchronized(generationLock) { _motorIntent.updateAndGet { current ->
+        MotorIntent(current.generation + 1, DesiredAxisState.Stop, DesiredAxisState.Stop, reason)
+    } }
+
     suspend fun emergencyStop(reason: String, onGeneration: (Long) -> Unit = {}): StopDiagnosticStatus {
         val stopIntent = synchronized(generationLock) { _motorIntent.updateAndGet { current ->
             MotorIntent(
@@ -128,10 +132,20 @@ class MotorCommandCoordinator(
         } }
 
         onGeneration(stopIntent.generation)
+        return sendStop(stopIntent, timeoutMs = 4000, onlyIfCurrent = false)
+    }
+
+    /** Does not publish a generation: an obsolete delayed safety job cannot override new intent. */
+    suspend fun stopIfCurrent(stopIntent: MotorIntent, timeoutMs: Long = 4000): StopDiagnosticStatus =
+        sendStop(stopIntent, timeoutMs, onlyIfCurrent = true)
+
+    private suspend fun sendStop(stopIntent: MotorIntent, timeoutMs: Long, onlyIfCurrent: Boolean): StopDiagnosticStatus {
+        val reason = stopIntent.reason
         // Stale queued signals are rejected by their generation; do not drain a newer intent.
         logger("GEN ${stopIntent.generation} requested STOP ($reason)", false)
 
         return withContext(NonCancellable) { movementMutex.withLock {
+            if (onlyIfCurrent && _motorIntent.get().generation != stopIntent.generation) return@withLock StopDiagnosticStatus.STOP_REQUESTED
             if (!usbConnection.isConnected()) {
                 val warning = "SAFETY WARNING: STOP unavailable — USB connection lost; physical motor state unknown"
                 logger(warning, true)
@@ -144,7 +158,7 @@ class MotorCommandCoordinator(
             // 1. RA POS rate 0
             val raPosBytes = NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.POSITIVE, 0)
             try {
-                val rx = usbConnection.transactSafe(raPosBytes)
+                val rx = usbConnection.transactSafe(raPosBytes, timeoutMs, writeGate = if (onlyIfCurrent) { write -> admitWrite(stopIntent.generation, write = write) } else null)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP RA POS:\nTX ${raPosBytes.toHexString()}\nRX: $rxStr", false)
                 if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
@@ -157,7 +171,7 @@ class MotorCommandCoordinator(
             // 2. RA NEG rate 0
             val raNegBytes = NexStarProtocol.fixedSlew(SlewAxis.RA, SlewDirection.NEGATIVE, 0)
             try {
-                val rx = usbConnection.transactSafe(raNegBytes)
+                val rx = usbConnection.transactSafe(raNegBytes, timeoutMs, writeGate = if (onlyIfCurrent) { write -> admitWrite(stopIntent.generation, write = write) } else null)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP RA NEG:\nTX ${raNegBytes.toHexString()}\nRX: $rxStr", false)
                 if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
@@ -170,7 +184,7 @@ class MotorCommandCoordinator(
             // 3. DEC POS rate 0
             val decPosBytes = NexStarProtocol.fixedSlew(SlewAxis.DEC, SlewDirection.POSITIVE, 0)
             try {
-                val rx = usbConnection.transactSafe(decPosBytes)
+                val rx = usbConnection.transactSafe(decPosBytes, timeoutMs, writeGate = if (onlyIfCurrent) { write -> admitWrite(stopIntent.generation, write = write) } else null)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP DEC POS:\nTX ${decPosBytes.toHexString()}\nRX: $rxStr", false)
                 if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
@@ -183,7 +197,7 @@ class MotorCommandCoordinator(
             // 4. DEC NEG rate 0
             val decNegBytes = NexStarProtocol.fixedSlew(SlewAxis.DEC, SlewDirection.NEGATIVE, 0)
             try {
-                val rx = usbConnection.transactSafe(decNegBytes)
+                val rx = usbConnection.transactSafe(decNegBytes, timeoutMs, writeGate = if (onlyIfCurrent) { write -> admitWrite(stopIntent.generation, write = write) } else null)
                 val rxStr = if (rx.isNotEmpty()) rx.toHexString() else "NO RESPONSE"
                 logger("EMERGENCY STOP DEC NEG:\nTX ${decNegBytes.toHexString()}\nRX: $rxStr", false)
                 if (rx.size != 1 || rx[0] != '#'.code.toByte()) stopFailed = true
@@ -193,8 +207,10 @@ class MotorCommandCoordinator(
                 stopFailed = true
             }
 
-            currentAppliedRaState = DesiredAxisState.Stop
-            currentAppliedDecState = DesiredAxisState.Stop
+            if (!stopFailed) {
+                currentAppliedRaState = DesiredAxisState.Stop
+                currentAppliedDecState = DesiredAxisState.Stop
+            }
 
             if (stopFailed) {
                 val warnMsg = "SAFETY WARNING: Emergency STOP packet failed or missing '#' response!"

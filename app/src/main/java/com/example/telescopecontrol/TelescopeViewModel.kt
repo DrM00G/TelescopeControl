@@ -8,6 +8,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.telescopecontrol.coordinator.MotorCommandCoordinator
+import com.example.telescopecontrol.coordinator.HeartbeatPolicy
 import com.example.telescopecontrol.model.AlignmentTrust
 import com.example.telescopecontrol.model.DesiredAxisState
 import com.example.telescopecontrol.model.EquatorialCoordinates
@@ -130,6 +131,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     )
 
     private val travelEnvelope = MountTravelEnvelope()
+    private val heartbeatPolicy = HeartbeatPolicy()
 
     // Outlives viewModelScope so lifecycle shutdown can finish before closing the port.
     private val safetyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -290,6 +292,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     error = null
                 )
             }
+            heartbeatPolicy.reset()
             initializeMountAndStartLoops()
         } catch (e: IOException) {
             log("Exception opening port: ${e.message}", isError = true)
@@ -461,7 +464,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
 
-                if (!_uiState.value.isSlewing && !_uiState.value.busy) {
+                if (!_uiState.value.busy) {
                     checkMotorControllerHeartbeatInternal()
                 }
             }
@@ -469,64 +472,70 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private suspend fun checkMotorControllerHeartbeatInternal() {
+        val epoch = controlEpoch
         var raVersionStr: String? = null
         var decVersionStr: String? = null
 
         try {
             val raRx = usbConnection.transactSafe(NexStarProtocol.GET_RA_MC_VERSION, timeoutMs = 2000)
             raVersionStr = NexStarProtocol.parseMotorControllerVersion(raRx)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
         }
 
         try {
             val decRx = usbConnection.transactSafe(NexStarProtocol.GET_DEC_MC_VERSION, timeoutMs = 2000)
             decVersionStr = NexStarProtocol.parseMotorControllerVersion(decRx)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
         }
 
+        if (epoch != controlEpoch || shuttingDown || !usbConnection.isConnected()) return
         val raOk = raVersionStr != null
         val decOk = decVersionStr != null
 
-        val newMountStatus = when {
-            raOk && decOk -> MountStatus.ONLINE
-            raOk || decOk -> MountStatus.PARTIAL
-            else -> MountStatus.OFFLINE
-        }
-
         val previousState = _uiState.value
+        val result = heartbeatPolicy.record(raOk, decOk, previousState.mountStatus)
+        val newMountStatus = result.status
+        val stopIntent = if (result.stop) {
+            controlEpoch++
+            raOverride = null
+            decOverride = null
+            motorCoordinator.invalidateForStop("HEARTBEAT_FAILURE")
+        } else if (result.quiet) {
+            controlEpoch++
+            motorCoordinator.invalidateForDisconnect()
+        } else null
         val prevMountStatus = previousState.mountStatus
         if (prevMountStatus == MountStatus.ONLINE && newMountStatus == MountStatus.OFFLINE) {
             log("AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING", isError = true)
         } else if (prevMountStatus == MountStatus.OFFLINE && newMountStatus == MountStatus.ONLINE) {
             log("AVX POWER RESTORED")
         }
-        if (newMountStatus == MountStatus.OFFLINE) {
-            if (previousState.manualTrackEnabled) log("Mount offline: Manual Track disabled and velocities reset to 0.", isError = true)
-            controlEpoch++
-            motorCoordinator.resetStatesQuietly()
-            raOverride = null
-            decOverride = null
-        }
         _uiState.update { state ->
             val prevMountStatus = state.mountStatus
             var updatedTrust = state.alignmentTrust
             var warning = state.alignmentWarning
 
-            val newHeartbeatCount = if (raOk && decOk) state.consecutiveHeartbeats + 1 else 0
-            val newIsAvxReady = newHeartbeatCount >= 2 && newMountStatus == MountStatus.ONLINE
+            val newHeartbeatCount = result.successes
+            val newIsAvxReady = result.ready
 
-            if (prevMountStatus == MountStatus.ONLINE && newMountStatus == MountStatus.OFFLINE) {
-                warning = "AVX POWER LOST / MOTOR CONTROLLERS NOT RESPONDING"
+            if (result.stop) {
+                warning = "AVX COMMUNICATION INTERRUPTED — STOPPING MOTORS"
+            } else if (newMountStatus == MountStatus.OFFLINE) {
+                warning = "AVX OFFLINE — MOTOR CONTROLLERS NOT RESPONDING"
             } else if (prevMountStatus == MountStatus.OFFLINE && newMountStatus == MountStatus.ONLINE) {
                 updatedTrust = AlignmentTrust.STALE_AFTER_POWER_LOSS
-                warning = "AVX POWER RESTORED — Alignment is stale"
+                warning = "AVX COMMUNICATION RESTORED — Alignment may be stale"
+            } else if (raOk && decOk && warning == "AVX COMMUNICATION INTERRUPTED — STOPPING MOTORS") {
+                warning = null
             }
 
             var isManualTrack = state.manualTrackEnabled
             var bgRa = state.backgroundRaArcsecPerSec
             var bgDec = state.backgroundDecArcsecPerSec
 
-            if (newMountStatus == MountStatus.OFFLINE) {
+            if (!raOk || !decOk) {
                 isManualTrack = false
                 bgRa = 0.0
                 bgDec = 0.0
@@ -542,8 +551,30 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
                 isAvxReady = newIsAvxReady,
                 manualTrackEnabled = isManualTrack,
                 backgroundRaArcsecPerSec = bgRa,
-                backgroundDecArcsecPerSec = bgDec
+                backgroundDecArcsecPerSec = bgDec,
+                isSlewing = if (stopIntent != null) false else state.isSlewing,
+                activeSlewAxis = if (stopIntent != null) null else state.activeSlewAxis,
+                activeSlewDirection = if (stopIntent != null) null else state.activeSlewDirection,
+                activeRaDirection = if (stopIntent != null) null else state.activeRaDirection,
+                activeDecDirection = if (stopIntent != null) null else state.activeDecDirection,
+                desiredRa = if (stopIntent != null) DesiredAxisState.Stop else state.desiredRa,
+                desiredDec = if (stopIntent != null) DesiredAxisState.Stop else state.desiredDec,
+                commandedRaArcsecPerSec = if (stopIntent != null) 0.0 else state.commandedRaArcsecPerSec,
+                commandedDecArcsecPerSec = if (stopIntent != null) 0.0 else state.commandedDecArcsecPerSec,
+                highSpeedBackgroundWarning = if (stopIntent != null) false else state.highSpeedBackgroundWarning,
+                motorGeneration = stopIntent?.generation ?: state.motorGeneration,
+                stopDiagnosticStatus = if (result.stop) StopDiagnosticStatus.STOP_REQUESTED else state.stopDiagnosticStatus
             )
+        }
+        if (stopIntent != null) {
+            if (result.stop) {
+                val status = motorCoordinator.stopIfCurrent(stopIntent, timeoutMs = 250)
+                if (motorCoordinator.currentIntent.generation == stopIntent.generation && !shuttingDown) {
+                    _uiState.update { it.copy(stopDiagnosticStatus = status) }
+                }
+            } else {
+                motorCoordinator.resetAppliedIfCurrent(stopIntent.generation)
+            }
         }
     }
 
@@ -864,7 +895,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun adjustBackgroundRa(delta: Double) {
-        if (trackingSetupPending || shuttingDown || stopPending) return
+        if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update {
             val newRa = (it.backgroundRaArcsecPerSec + delta).coerceIn(-14400.0, 14400.0)
@@ -874,7 +905,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun adjustBackgroundDec(delta: Double) {
-        if (trackingSetupPending || shuttingDown || stopPending) return
+        if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update {
             val newDec = (it.backgroundDecArcsecPerSec + delta).coerceIn(-14400.0, 14400.0)
@@ -884,21 +915,21 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun zeroBackgroundRa() {
-        if (trackingSetupPending || shuttingDown || stopPending) return
+        if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update { it.copy(backgroundRaArcsecPerSec = 0.0) }
         recalculateAndApplyDesiredStates("ZERO_BACKGROUND")
     }
 
     fun zeroBackgroundDec() {
-        if (trackingSetupPending || shuttingDown || stopPending) return
+        if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update { it.copy(backgroundDecArcsecPerSec = 0.0) }
         recalculateAndApplyDesiredStates("ZERO_BACKGROUND")
     }
 
     fun zeroBackgroundBoth() {
-        if (trackingSetupPending || shuttingDown || stopPending) return
+        if (trackingSetupPending || shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         controlEpoch++
         _uiState.update {
             it.copy(
@@ -914,7 +945,7 @@ class TelescopeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun recalculateAndApplyDesiredStates(reason: String) {
-        if (shuttingDown || stopPending) return
+        if (shuttingDown || stopPending || !_uiState.value.isAvxReady) return
         val state = _uiState.value
         val manualRate = state.slewRate
         val isManualTrack = state.manualTrackEnabled
